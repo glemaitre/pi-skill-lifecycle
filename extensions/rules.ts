@@ -45,6 +45,27 @@ export interface EngineConfig {
   pinned?: string[];
   /** Whether to log notifications on skill changes. Default: true */
   verbose?: boolean;
+
+  // ── Sticky optimisation ──────────────────────────────────────
+  /**
+   * After N consecutive turns being kept, a volatile skill auto-promotes
+   * to "sticky" and stops being re-scored. 0 = disabled. Default: 3.
+   */
+  stickyThreshold?: number;
+
+  // ── Change-detection optimisation ────────────────────────────
+  /** Skip scoring when the prompt is a short follow-up. Default: true */
+  skipOnShortPrompts?: boolean;
+  /**
+   * Prompts shorter than this many characters skip scoring.
+   * Only used when skipOnShortPrompts is true. Default: 15.
+   */
+  minScorablePromptLength?: number;
+  /**
+   * Token overlap ratio above which a prompt is considered the same topic.
+   * Range 0..1. Default: 0.7.
+   */
+  topicChangeThreshold?: number;
 }
 
 /**
@@ -65,6 +86,10 @@ export const DEFAULT_CONFIG: Required<EngineConfig> = {
   rules: [],
   pinned: [],
   verbose: true,
+  stickyThreshold: 3,
+  skipOnShortPrompts: true,
+  minScorablePromptLength: 15,
+  topicChangeThreshold: 0.7,
 };
 
 /**
@@ -76,6 +101,10 @@ export function configWithDefaults(partial?: EngineConfig): Required<EngineConfi
     ...partial,
     rules: partial?.rules ?? [],
     pinned: partial?.pinned ?? [],
+    stickyThreshold: partial?.stickyThreshold ?? DEFAULT_CONFIG.stickyThreshold,
+    skipOnShortPrompts: partial?.skipOnShortPrompts ?? DEFAULT_CONFIG.skipOnShortPrompts,
+    minScorablePromptLength: partial?.minScorablePromptLength ?? DEFAULT_CONFIG.minScorablePromptLength,
+    topicChangeThreshold: partial?.topicChangeThreshold ?? DEFAULT_CONFIG.topicChangeThreshold,
   };
 }
 
@@ -239,6 +268,59 @@ export const CONFIG_FILENAME = "skill-lifecycle.json";
  * Try to load engine config from a JSON file.
  * Returns undefined if the file doesn't exist or is unreadable.
  */
+// ── Change detection ────────────────────────────────────────────
+
+/**
+ * Token set of a previous prompt, used to decide whether the topic shifted.
+ */
+export type PromptFingerprint = Set<string>;
+
+/**
+ * Build a fingerprint from a prompt for change-detection comparisons.
+ */
+export function fingerprintPrompt(prompt: string): PromptFingerprint {
+  return tokenize(prompt);
+}
+
+/**
+ * Determine whether a new prompt represents the same task as the previous one.
+ *
+ * Returns true when the prompt should **skip** re-scoring because:
+ * - It is a very short follow-up ("yes", "continue", "run it")
+ * - It has high token overlap with the previous prompt (> topicChangeThreshold)
+ *
+ * Returns false when a full re-score is warranted.
+ */
+export function isMinorChange(
+  currentPrompt: string,
+  previousFingerprint: PromptFingerprint | undefined,
+  config: Required<EngineConfig>,
+): boolean {
+  if (previousFingerprint === undefined || previousFingerprint.size === 0) {
+    return false; // first turn or empty previous state → always score
+  }
+
+  const trimmed = currentPrompt.trim();
+
+  // Very short prompts are almost always acknowledgements or brief follow-ups
+  if (config.skipOnShortPrompts && trimmed.length < config.minScorablePromptLength) {
+    return true;
+  }
+
+  // Token overlap ratio: if most of the current tokens appeared in the previous prompt,
+  // the topic hasn't changed.
+  const currentTokens = tokenize(trimmed);
+  if (currentTokens.size === 0) return true; // no meaningful tokens → minor
+
+  let overlapCount = 0;
+  for (const token of currentTokens) {
+    if (previousFingerprint.has(token)) overlapCount++;
+  }
+  const overlapRatio = overlapCount / currentTokens.size;
+
+  return overlapRatio >= config.topicChangeThreshold;
+}
+
 export async function loadConfigFromFile(
   cwd: string,
   filename: string = CONFIG_FILENAME,

@@ -5,6 +5,10 @@
   "maxKeep": 0,
   "verbose": true,
   "pinned": [],
+  "stickyThreshold": 3,
+  "skipOnShortPrompts": true,
+  "minScorablePromptLength": 15,
+  "topicChangeThreshold": 0.7,
   "rules": [
     {
       "skillName": "build-ml-pipeline",

@@ -13,6 +13,8 @@ import {
   configWithDefaults,
   DEFAULT_CONFIG,
   buildChangeSummary,
+  isMinorChange,
+  fingerprintPrompt,
 } from "../extensions/rules.ts";
 import type { Skill, RelevanceRule } from "../extensions/rules.ts";
 
@@ -262,6 +264,10 @@ describe("configWithDefaults", () => {
     expect(cfg.minKeep).toBe(DEFAULT_CONFIG.minKeep);
     expect(cfg.rules).toEqual([]);
     expect(cfg.pinned).toEqual([]);
+    expect(cfg.stickyThreshold).toBe(3);
+    expect(cfg.skipOnShortPrompts).toBe(true);
+    expect(cfg.minScorablePromptLength).toBe(15);
+    expect(cfg.topicChangeThreshold).toBe(0.7);
   });
 
   it("preserves fields that are set", () => {
@@ -270,5 +276,80 @@ describe("configWithDefaults", () => {
     expect(cfg.minKeep).toBe(DEFAULT_CONFIG.minKeep);
     expect(cfg.pinned).toEqual(["test"]);
     expect(cfg.rules).toEqual([]);
+    expect(cfg.stickyThreshold).toBe(3);
+    expect(cfg.skipOnShortPrompts).toBe(true);
+  });
+});
+
+// ── isMinorChange ─────────────────────────────────────────────────
+
+describe("isMinorChange", () => {
+  const cfg = configWithDefaults({});
+
+  it("returns false when there is no previous fingerprint (first turn)", () => {
+    expect(isMinorChange("build a classifier", undefined, cfg)).toBe(false);
+  });
+
+  it("returns false when previous fingerprint is empty", () => {
+    expect(isMinorChange("build a classifier", new Set(), cfg)).toBe(false);
+  });
+
+  it("returns true for very short prompts (acknowledgements)", () => {
+    const prev = fingerprintPrompt("build a classifier with sklearn");
+    expect(isMinorChange("yes", prev, cfg)).toBe(true);
+    expect(isMinorChange("ok", prev, cfg)).toBe(true);
+    expect(isMinorChange("run it", prev, cfg)).toBe(true);
+    expect(isMinorChange("continue", prev, cfg)).toBe(true);
+  });
+
+  it("returns true when the prompt length is below minScorablePromptLength", () => {
+    const prev = fingerprintPrompt("build a classifier with sklearn");
+    // "go ahead" is 8 chars, below default of 15
+    expect(isMinorChange("go ahead", prev, cfg)).toBe(true);
+  });
+
+  it("respects a custom minScorablePromptLength", () => {
+    const shortCfg = configWithDefaults({ minScorablePromptLength: 5, skipOnShortPrompts: true });
+    const prev = fingerprintPrompt("build a classifier");
+    // "hello" is 5 chars, not below threshold
+    expect(isMinorChange("hello", prev, shortCfg)).toBe(false);
+    // "hi" is 2 chars, below threshold
+    expect(isMinorChange("hi", prev, shortCfg)).toBe(true);
+  });
+
+  it("does not skip short prompts when skipOnShortPrompts is false", () => {
+    const noSkipCfg = configWithDefaults({ skipOnShortPrompts: false });
+    const prev = fingerprintPrompt("build a classifier with sklearn");
+    expect(isMinorChange("yes", prev, noSkipCfg)).toBe(false);
+  });
+
+  it("returns true when high token overlap with previous prompt", () => {
+    const prev = fingerprintPrompt("build a random forest classifier with sklearn");
+    // 4/4 tokens overlap → 1.0 ratio, well above 0.7 threshold
+    expect(isMinorChange("random forest classifier sklearn", prev, cfg)).toBe(true);
+  });
+
+  it("returns false when topic clearly changed", () => {
+    const prev = fingerprintPrompt("build a random forest classifier with sklearn");
+    // Completely different topic — low token overlap
+    expect(isMinorChange("explore the data distributions and outliers", prev, cfg)).toBe(false);
+  });
+
+  it("uses topicChangeThreshold from config", () => {
+    // threshold 0.4 means 40%+ overlap needed to consider it the same topic
+    const cfg40 = configWithDefaults({ topicChangeThreshold: 0.4 });
+    const prev = fingerprintPrompt("build a random forest classifier with sklearn");
+    // "build an xgboost model" has 33% overlap (1/3) → below 40% → not minor
+    expect(isMinorChange("build an xgboost model", prev, cfg40)).toBe(false);
+
+    // With threshold 0.2 (only 20% needed), 33% overlap IS enough → minor
+    const cfg20 = configWithDefaults({ topicChangeThreshold: 0.2 });
+    expect(isMinorChange("build an xgboost model", prev, cfg20)).toBe(true);
+  });
+
+  it("returns true when current prompt has no meaningful tokens", () => {
+    const prev = fingerprintPrompt("build a classifier");
+    expect(isMinorChange("a", prev, cfg)).toBe(true);
+    expect(isMinorChange("", prev, cfg)).toBe(true);
   });
 });

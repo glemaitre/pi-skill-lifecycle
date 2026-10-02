@@ -17,23 +17,39 @@
  */
 
 import type { ExtensionAPI, Skill as PiSkill } from "@earendil-works/pi-coding-agent";
-import type { Skill, EngineConfig, RelevanceRule } from "./rules.ts";
+import type { Skill, EngineConfig, RelevanceRule, PromptFingerprint } from "./rules.ts";
 import {
   configWithDefaults,
   CONFIG_FILENAME,
   scoreRelevance,
   selectRelevantSkills,
   buildChangeSummary,
+  fingerprintPrompt,
+  isMinorChange,
 } from "./rules.ts";
 
 export default function (pi: ExtensionAPI) {
   // ── State ───────────────────────────────────────────────────────
 
+  // ── Core state ──────────────────────────────────────────────────
+
   /** All skills we've ever seen, for `/skills-list` and config reloads. */
   let allKnownSkills: PiSkill[] = [];
 
-  /** Pinned skill names (lowercase). */
+  /** Pinned skill names (lowercase) — user-set, survive reloads. */
   const pinned = new Set<string>();
+
+  /**
+   * Auto-promoted sticky skills — kept for N+ consecutive turns without
+   * being dropped. Session-scoped only, not persisted.
+   */
+  const sticky = new Set<string>();
+
+  /**
+   * How many consecutive turns each volatile skill has been kept.
+   * Resets to 0 when the skill is dropped.
+   */
+  const consecutiveLoads = new Map<string, number>();
 
   /** Whether automatic filtering is enabled. */
   let enabled = true;
@@ -46,6 +62,17 @@ export default function (pi: ExtensionAPI) {
 
   /** Cached workspace root. */
   let workspaceRoot = "";
+
+  // ── Change-detection state ───────────────────────────────────────
+
+  /** Fingerprint of the last prompt that triggered a full scoring pass. */
+  let lastPromptFingerprint: PromptFingerprint | undefined;
+
+  /** Skill names returned by the last scoring pass. */
+  let lastScoredNames: string[] | undefined;
+
+  /** The full PiSkill[] returned by the last scoring pass. */
+  let lastScoredSkills: PiSkill[] | undefined;
 
   // ── Helpers ─────────────────────────────────────────────────────
 
@@ -86,9 +113,51 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  // ── Sticky helpers ───────────────────────────────────────────────
+
+  /**
+   * Whether a skill is "always kept" — either explicitly pinned or
+   * auto-promoted to sticky.
+   */
+  function isAlwaysKept(skillName: string): boolean {
+    return pinned.has(skillName) || sticky.has(skillName);
+  }
+
+  /**
+   * After a scoring pass, update sticky counters:
+   * - Skills that were kept → increment counter
+   * - Skills that were dropped → reset counter to 0
+   * - Skills that hit stickyThreshold → promote to sticky
+   */
+  function updateStickyCounters(
+    keptNames: Set<string>,
+    allVolatile: PiSkill[],
+  ): void {
+    if (config.stickyThreshold <= 0) return;
+
+    for (const skill of allVolatile) {
+      if (keptNames.has(skill.name)) {
+        const count = (consecutiveLoads.get(skill.name) ?? 0) + 1;
+        consecutiveLoads.set(skill.name, count);
+        if (count >= config.stickyThreshold && !sticky.has(skill.name)) {
+          sticky.add(skill.name);
+          consecutiveLoads.delete(skill.name);
+        }
+      } else {
+        consecutiveLoads.delete(skill.name);
+      }
+    }
+  }
+
   /**
    * Apply filtering: if enabled, remove irrelevant skills from the
    * system prompt options for the next model call.
+   *
+   * Optimisation: the function has three early-exit paths to avoid
+   * re-scoring every single turn:
+   *   1. All skills are pinned/sticky → skip (zero work)
+   *   2. Prompt is a minor change (short / same topic) → reuse last result
+   *   3. Full scoring (only when needed)
    */
   function applyFiltering(
     prompt: string,
@@ -99,16 +168,46 @@ export default function (pi: ExtensionAPI) {
       return skills;
     }
 
-    const pureSkills = skills.map(toPureSkill);
-    const { kept, dropped } = selectRelevantSkills(prompt, pureSkills, pinned, config);
+    // ── Optimisation 1: all skills are always-kept → zero work ──
+    const volatile = skills.filter((s) => !isAlwaysKept(s.name));
+    if (volatile.length === 0) {
+      return skills; // nothing to filter
+    }
 
+    // ── Optimisation 2: minor change → reuse last scoring result ──
+    if (lastPromptFingerprint !== undefined && lastScoredSkills !== undefined) {
+      if (isMinorChange(prompt, lastPromptFingerprint, config)) {
+        // Re-apply the last kept set to the current skill list
+        const keptNames = new Set(lastScoredNames!);
+        const result = skills.filter((s) => keptNames.has(s.name));
+        // Ensure minKeep: if the previous result would drop too many, keep all
+        if (result.length >= config.minKeep) {
+          return result;
+        }
+      }
+    }
+
+    // ── Full scoring ────────────────────────────────────────────
+    const combinedAlwaysKeep = new Set([...pinned, ...sticky]);
+    const pureSkills = skills.map(toPureSkill);
+    const { kept, dropped } = selectRelevantSkills(prompt, pureSkills, combinedAlwaysKeep, config);
+
+    // Notify about changes
     if (dropped.length > 0 && config.verbose) {
       const summary = buildChangeSummary(kept, dropped, skills.length);
       _ctx.ui.notify(summary, "info");
     }
 
-    // Return is a PiSkill[]; we map back using the original objects
+    // Update sticky counters for volatile skills
     const keptNames = new Set(kept.map((s) => s.name));
+    updateStickyCounters(keptNames, volatile);
+
+    // Save state for change detection on the next turn
+    lastPromptFingerprint = fingerprintPrompt(prompt);
+    lastScoredNames = kept.map((s) => s.name);
+    lastScoredSkills = kept;
+
+    // Map back to PiSkill[] using the original objects
     return skills.filter((s) => keptNames.has(s.name));
   }
 
@@ -178,14 +277,15 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       const lines = allKnownSkills.map((s) => {
         const pin = pinned.has(s.name) ? " 📌" : "";
-        const { score, reason } = scoreRelevance("", toPureSkill(s), customRules);
-        return `  ${s.name}${pin} — ${s.description}`;
+        const stk = sticky.has(s.name) ? " 🔥" : "";
+        return `  ${s.name}${pin}${stk} — ${s.description}`;
       });
       const status = enabled ? "🟢 enabled" : "🔴 disabled";
       ctx.ui.notify(
         `Known skills (${allKnownSkills.length}) — ${status}:\n${lines.join("\n")}\n\n` +
         `Pin skills: /skills-pin <name>   Unpin: /skills-unpin <name>\n` +
-        `Toggle: /skills-on | /skills-off   Reload config: /skills-reload`,
+        `Toggle: /skills-on | /skills-off   Reload config: /skills-reload\n` +
+        `🔥 = sticky (auto-promoted, not re-scored)`,
         "info",
       );
     },
