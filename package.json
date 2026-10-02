@@ -2,12 +2,18 @@
   "name": "pi-skill-lifecycle",
   "version": "0.1.0",
   "description": "Dynamically load and unload Pi skills based on conversation relevance — saves context, reduces noise.",
-  "keywords": ["pi-package", "skill-lifecycle", "skill-management"],
+  "keywords": [
+    "pi-package",
+    "skill-lifecycle",
+    "skill-management"
+  ],
   "license": "MIT",
   "author": "",
   "type": "module",
   "pi": {
-    "extensions": ["./extensions/index.ts"]
+    "extensions": [
+      "./extensions/index.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
@@ -19,5 +25,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "typescript": "^7.0.2"
   }
 }

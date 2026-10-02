@@ -18,6 +18,7 @@
 
 import type { ExtensionAPI, Skill as PiSkill } from "@earendil-works/pi-coding-agent";
 import type { Skill, EngineConfig, RelevanceRule, PromptFingerprint } from "./rules.ts";
+import { Type } from "typebox";
 import {
   configWithDefaults,
   CONFIG_FILENAME,
@@ -239,6 +240,119 @@ export default function (pi: ExtensionAPI) {
 
     const filtered = applyFiltering(event.prompt, skills, ctx);
     event.systemPromptOptions.skills = filtered;
+  });
+
+  // ── Skill tool (OpenCode-compatible native skill loader) ────────
+
+  /**
+   * Register a `skill` tool that the model can call to load a skill's
+   * full instructions — mirroring OpenCode's native skill tool pattern.
+   *
+   * Instead of reading SKILL.md files directly, the model calls this tool
+   * with the skill name. The tool returns the skill content, base
+   * directory, and related files, coupled with the relevance filtering.
+   */
+  pi.registerTool({
+    name: "skill",
+    label: "Skill loader",
+    description: [
+      "Load a skill's full instructions by name.",
+      "",
+      "When you recognize that a task matches one of the available skills listed in the system prompt,",
+      "use this tool to load the full skill instructions instead of reading the SKILL.md file directly.",
+      "It returns the skill content, its base directory, and related files.",
+    ].join("\n"),
+    promptSnippet: "Load skill instructions by name (use instead of reading SKILL.md directly)",
+    promptGuidelines: [
+      "You have access to a `skill` tool to load skill instructions. When a task matches an available skill, call the tool instead of reading SKILL.md directly.",
+    ],
+    parameters: Type.Object({
+      name: Type.String({
+        description: "The name of the skill to load, from the available skills listed in the system prompt",
+      }),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const skillName = params.name;
+      const skill = allKnownSkills.find((s) => s.name === skillName);
+
+      if (!skill) {
+        const available = allKnownSkills
+          .filter((s) => !s.disableModelInvocation)
+          .map((s) => s.name)
+          .join(", ");
+        return {
+          content: [{
+            type: "text",
+            text: `Skill "${skillName}" not found. Available skills: ${available || "none"}`,
+          }],
+          details: undefined,
+        };
+      }
+
+      if (skill.disableModelInvocation) {
+        return {
+          content: [{
+            type: "text",
+            text: `Skill "${skillName}" is not available for automatic model loading. Use the /skill:${skillName} command to invoke it manually.`,
+          }],
+          details: undefined,
+        };
+      }
+
+      try {
+        const fs = await import("node:fs/promises");
+        const pathMod = await import("node:path");
+
+        // Read the SKILL.md content
+        const content = await fs.readFile(skill.filePath, "utf-8");
+
+        // List files in the skill directory (excluding SKILL.md, up to 10)
+        const dir = skill.baseDir || pathMod.dirname(skill.filePath);
+        let files: string[] = [];
+        try {
+          const entries = await fs.readdir(dir);
+          files = entries
+            .filter((f: string) => f !== "SKILL.md" && !f.startsWith("."))
+            .slice(0, 10)
+            .map((f: string) => pathMod.join(dir, f));
+        } catch {
+          // Directory listing not available — proceed without file list
+        }
+
+        const fileSection = files.length > 0
+          ? [
+            "",
+            "<skill_files>",
+            ...files.map((f) => `  <file>${f}</file>`),
+            "</skill_files>",
+          ].join("\n")
+          : "";
+
+        return {
+          content: [{
+            type: "text",
+            text: [
+              `<skill_content name="${skill.name}">`,
+              `# Skill: ${skill.name}`,
+              "",
+              content.trim(),
+              "",
+              `Base directory for this skill: ${dir}`,
+              "Relative paths in this skill (e.g., scripts/, references/, assets/) are relative to this base directory.",
+              fileSection,
+              "</skill_content>",
+            ].join("\n"),
+          }],
+          details: undefined,
+        };
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Error reading skill "${skillName}": ${err}` }],
+          details: undefined,
+          isError: true,
+        };
+      }
+    },
   });
 
   // ── Commands ────────────────────────────────────────────────────
