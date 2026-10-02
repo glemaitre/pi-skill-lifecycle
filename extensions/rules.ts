@@ -356,3 +356,38 @@ export function buildChangeSummary(
     `   Dropped: ${droppedNames}`,
   ].join("\n");
 }
+
+// ── Skill body helpers ────────────────────────────────────────────
+
+/**
+ * Regex to extract a skill name from its `<skill_content>` wrapper.
+ */
+export const SKILL_CONTENT_RE = /<skill_content name="([^"]+)">/;
+
+/**
+ * Scan a tool result's content blocks for a `<skill_content>` wrapper
+ * and return the skill name, or null if this isn't skill body content.
+ */
+export function extractSkillNameFromContent(
+  content: Array<{ type: string; text?: string }>,
+): string | null {
+  for (const block of content) {
+    if (block.type === "text" && block.text) {
+      const match = block.text.match(SKILL_CONTENT_RE);
+      if (match) return match[1];
+    }
+  }
+  return null;
+}
+
+/**
+ * Build the placeholder text that replaces an evicted skill body.
+ */
+export function buildPlaceholder(skillName: string): string {
+  return [
+    `<skill_content name="${skillName}">`,
+    `  [Previously loaded skill body — archived because the topic shifted.`,
+    `   Call \`skill("${skillName}")\` to reload when needed.]`,
+    `</skill_content>`,
+  ].join("\n");
+}

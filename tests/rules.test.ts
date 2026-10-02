@@ -15,6 +15,8 @@ import {
   buildChangeSummary,
   isMinorChange,
   fingerprintPrompt,
+  extractSkillNameFromContent,
+  buildPlaceholder,
 } from "../extensions/rules.ts";
 import type { Skill, RelevanceRule } from "../extensions/rules.ts";
 
@@ -351,5 +353,80 @@ describe("isMinorChange", () => {
     const prev = fingerprintPrompt("build a classifier");
     expect(isMinorChange("a", prev, cfg)).toBe(true);
     expect(isMinorChange("", prev, cfg)).toBe(true);
+  });
+});
+
+// ── extractSkillNameFromContent ───────────────────────────────────
+
+describe("extractSkillNameFromContent", () => {
+  it("extracts skill name from <skill_content> wrapper", () => {
+    const content = [
+      { type: "text", text: '<skill_content name="build-ml-pipeline">\n# Skill: build-ml-pipeline' },
+    ];
+    expect(extractSkillNameFromContent(content)).toBe("build-ml-pipeline");
+  });
+
+  it("returns null when content has no skill wrapper", () => {
+    const content = [
+      { type: "text", text: "Some random tool output without skill content" },
+    ];
+    expect(extractSkillNameFromContent(content)).toBeNull();
+  });
+
+  it("returns null for empty content array", () => {
+    expect(extractSkillNameFromContent([])).toBeNull();
+  });
+
+  it("scans multiple blocks to find the wrapper", () => {
+    const content = [
+      { type: "text", text: "Some preliminary output" },
+      { type: "text", text: '<skill_content name="explore-ml-data">\n...' },
+    ];
+    expect(extractSkillNameFromContent(content)).toBe("explore-ml-data");
+  });
+
+  it("handles image blocks without crashing", () => {
+    const content = [
+      { type: "image", data: "abc", mimeType: "image/png" } as any,
+    ];
+    expect(extractSkillNameFromContent(content)).toBeNull();
+  });
+
+  it("handles mixed image and text blocks", () => {
+    const content = [
+      { type: "image", data: "abc", mimeType: "image/png" } as any,
+      { type: "text", text: '<skill_content name="audit-ml-pipeline">' },
+    ];
+    expect(extractSkillNameFromContent(content)).toBe("audit-ml-pipeline");
+  });
+
+  it("matches only <skill_content> open tags, not text containing it", () => {
+    const content = [
+      { type: "text", text: "some text <skill_content name=\"something\"> else" },
+    ];
+    expect(extractSkillNameFromContent(content)).toBe("something");
+  });
+});
+
+// ── buildPlaceholder ──────────────────────────────────────────────
+
+describe("buildPlaceholder", () => {
+  it("wraps skill name in a <skill_content> placeholder", () => {
+    const result = buildPlaceholder("build-ml-pipeline");
+    expect(result).toContain('<skill_content name="build-ml-pipeline">');
+    expect(result).toContain("</skill_content>");
+    expect(result).toContain("archived because the topic shifted");
+    expect(result).toContain('skill("build-ml-pipeline")');
+  });
+
+  it("tells the model it can reload the skill", () => {
+    const result = buildPlaceholder("explore-ml-data");
+    expect(result).toContain("reload when needed");
+  });
+
+  it("produces valid XML-like tags", () => {
+    const result = buildPlaceholder("test-skill");
+    expect(result).toMatch(/^<skill_content/);
+    expect(result).toMatch(/<\/skill_content>$/);
   });
 });
