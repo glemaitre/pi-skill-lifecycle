@@ -35,9 +35,9 @@ export interface RelevanceRule {
 export interface EngineConfig {
   /** Minimum score (0..1) a skill needs to be kept. Default: 0.15 */
   threshold?: number;
-  /** Minimum number of skills to always keep. Default: 2 */
+  /** The N most recently loaded skill bodies are never evicted. Default: 2 */
   minKeep?: number;
-  /** Maximum number of skills to keep. 0 = unlimited. Default: 0 */
+  /** Maximum number of loaded skill bodies. 0 = unlimited. Default: 0 */
   maxKeep?: number;
   /** Custom relevance rules */
   rules?: RelevanceRule[];
@@ -45,13 +45,14 @@ export interface EngineConfig {
   pinned?: string[];
   /** Whether to log notifications on skill changes. Default: true */
   verbose?: boolean;
-
-  // ── Sticky optimisation ──────────────────────────────────────
   /**
-   * After N consecutive turns being kept, a volatile skill auto-promotes
-   * to "sticky" and stops being re-scored. 0 = disabled. Default: 3.
+   * Skill the model should load first for ambiguous requests (for example
+   * `triage-ml-task`). Only mentioned in the prompt when it is installed.
+   * Default: "" (none).
    */
-  stickyThreshold?: number;
+  entrySkill?: string;
+  /** Block `read` calls on a known SKILL.md and point to the skill tool. Default: true */
+  blockDirectSkillReads?: boolean;
 
   // ── Change-detection optimisation ────────────────────────────
   /** Skip scoring when the prompt is a short follow-up. Default: true */
@@ -86,7 +87,8 @@ export const DEFAULT_CONFIG: Required<EngineConfig> = {
   rules: [],
   pinned: [],
   verbose: true,
-  stickyThreshold: 3,
+  entrySkill: "",
+  blockDirectSkillReads: true,
   skipOnShortPrompts: true,
   minScorablePromptLength: 15,
   topicChangeThreshold: 0.7,
@@ -101,7 +103,8 @@ export function configWithDefaults(partial?: EngineConfig): Required<EngineConfi
     ...partial,
     rules: partial?.rules ?? [],
     pinned: partial?.pinned ?? [],
-    stickyThreshold: partial?.stickyThreshold ?? DEFAULT_CONFIG.stickyThreshold,
+    entrySkill: partial?.entrySkill ?? DEFAULT_CONFIG.entrySkill,
+    blockDirectSkillReads: partial?.blockDirectSkillReads ?? DEFAULT_CONFIG.blockDirectSkillReads,
     skipOnShortPrompts: partial?.skipOnShortPrompts ?? DEFAULT_CONFIG.skipOnShortPrompts,
     minScorablePromptLength: partial?.minScorablePromptLength ?? DEFAULT_CONFIG.minScorablePromptLength,
     topicChangeThreshold: partial?.topicChangeThreshold ?? DEFAULT_CONFIG.topicChangeThreshold,
@@ -113,13 +116,26 @@ export function configWithDefaults(partial?: EngineConfig): Required<EngineConfi
 /**
  * Tokenize a string into a set of lowercase word stems (3+ chars).
  */
+/**
+ * Common English words that carry no topic. Without this list, "and"/"the"
+ * overlap between any prompt and any description keeps unrelated skills alive.
+ */
+const STOPWORDS = new Set([
+  "about", "after", "all", "also", "and", "any", "are", "before", "but", "can", "could",
+  "does", "each", "for", "from", "has", "have", "how", "into", "its", "just", "may",
+  "more", "most", "not", "now", "only", "other", "our", "out", "should", "some", "such",
+  "than", "that", "the", "their", "them", "then", "there", "these", "they", "this",
+  "use", "used", "using", "was", "were", "what", "when", "where", "which", "who", "why",
+  "will", "with", "would", "you", "your",
+]);
+
 export function tokenize(text: string): Set<string> {
   // Split on anything that's not a letter or digit — hyphens and underscores are
   // separators too so skill names like "build-ml-pipeline" break into individual tokens.
   const words = text
     .toLowerCase()
     .split(/[^a-z0-9]+/)
-    .filter((w) => w.length >= 3);
+    .filter((w) => w.length >= 3 && !STOPWORDS.has(w));
   return new Set(words);
 }
 
@@ -390,4 +406,65 @@ export function buildPlaceholder(skillName: string): string {
     `   Call \`skill("${skillName}")\` to reload when needed.]`,
     `</skill_content>`,
   ].join("\n");
+}
+// ── Body eviction ─────────────────────────────────────────────────
+
+/**
+ * A skill body currently loaded in the conversation. `seq` grows with every
+ * load, so a larger value means a more recent load.
+ */
+export interface LoadedBody {
+  name: string;
+  seq: number;
+}
+
+/**
+ * Decide which loaded skill bodies to evict for the next user prompt.
+ *
+ * - Pinned bodies are never evicted.
+ * - The `minKeep` most recently loaded bodies are never evicted, so the skill
+ *   being worked on survives replies that share no keywords with it.
+ * - Other bodies are evicted when their relevance score is below `threshold`.
+ * - If `maxKeep` > 0, the oldest unprotected survivors are evicted until at
+ *   most `maxKeep` bodies remain (pinned and recent bodies count but stay).
+ */
+export function selectBodiesToEvict(
+  prompt: string,
+  loaded: LoadedBody[],
+  skillsByName: ReadonlyMap<string, Skill>,
+  pinnedSet: ReadonlySet<string>,
+  config: Required<EngineConfig>,
+): Array<{ name: string; score: number; reason: string }> {
+  const byRecency = [...loaded].sort((a, b) => b.seq - a.seq);
+  const recent = new Set(byRecency.slice(0, Math.max(0, config.minKeep)).map((b) => b.name));
+  const isProtected = (name: string) => pinnedSet.has(name) || recent.has(name);
+
+  const evicted: Array<{ name: string; score: number; reason: string }> = [];
+  const survivors: LoadedBody[] = [];
+
+  for (const body of byRecency) {
+    if (isProtected(body.name)) {
+      survivors.push(body);
+      continue;
+    }
+    const skill = skillsByName.get(body.name);
+    if (!skill) {
+      evicted.push({ name: body.name, score: 0, reason: "skill no longer installed" });
+      continue;
+    }
+    const { score, reason } = scoreRelevance(prompt, skill, config.rules);
+    if (score < config.threshold) evicted.push({ name: body.name, score, reason });
+    else survivors.push(body);
+  }
+
+  if (config.maxKeep > 0) {
+    // survivors are ordered most recent first; drop from the oldest end.
+    for (let i = survivors.length - 1; i >= 0 && survivors.length > config.maxKeep; i--) {
+      if (isProtected(survivors[i].name)) continue;
+      const [body] = survivors.splice(i, 1);
+      evicted.push({ name: body.name, score: 0, reason: `over maxKeep (${config.maxKeep})` });
+    }
+  }
+
+  return evicted;
 }

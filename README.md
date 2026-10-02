@@ -1,159 +1,153 @@
 # Pi Skill Lifecycle
 
-Dynamically load and unload Pi skills based on what you're working on. Only the skills relevant to the current conversation stay in the system prompt — saving context window, reducing noise, and helping the model focus.
+OpenCode-style skill loading for Pi: a `skill` tool, a binding skill protocol in
+the prompt, and archiving of skill bodies that are no longer relevant.
 
-## How it works
+## Why
 
-Before each model call, the extension scores every loaded skill against the user's latest prompt:
+With Pi's default prompt, a model treats skills as reference material: it reads
+a SKILL.md, then may skip its stop conditions ("STOP when there is no scaffold,
+send to setup") and improvise. OpenCode tells the model to load skills through
+a dedicated tool and keeps the skill guidance separate from the core prompt.
+This extension brings that pattern to Pi and keeps loaded skill bodies from
+accumulating in the context window.
 
-1. **Rule matching** — If a skill has explicit trigger keywords (from config), it checks those first.
-2. **Description overlap** — As a fallback, it compares the skill's description against the prompt.
-3. **Name boost** — If the skill's name appears in the prompt, it gets a lift.
-4. **Filtering** — Skills below a relevance threshold are removed from the prompt.
+## What it changes
 
-Pinned skills (via config or `/skills-pin`) are always kept.
+Pi already lists each skill by name, description, and location, and tells the
+model to `read` the SKILL.md when a task matches. This extension:
+
+1. **Replaces the prompt's `skills` section** with the same listing plus a
+   short protocol: load skills with the `skill` tool, route ambiguous requests
+   through an optional entry skill, and treat a skill's stop conditions as
+   binding. The section does not change between turns, so it never adds a
+   prompt update and does not break prompt caching.
+2. **Adds a `skill` tool** that returns the body (without frontmatter) wrapped
+   in `<skill_content>`, with its base directory and top-level files.
+3. **Blocks direct `read` calls on a known SKILL.md** and tells the model to
+   call `skill("<name>")` instead, so every body goes through the tool. Reading
+   files a skill references (`references/`, `templates/`, …) stays allowed.
+4. **Archives skill bodies** before each LLM request. A body is replaced by a
+   short placeholder when it was loaded again later (only the latest copy is
+   kept) or when it was evicted. The session file keeps the original results,
+   so archiving is per request and reversible; resume, fork, and `/tree`
+   rebuild the state from the session branch.
+
+If the `skill` tool is not active (for example `--tools read,bash`), Pi's
+default listing is left unchanged and no read is blocked.
+
+### Token cost
+
+The listing costs about the same as Pi's default (the protocol adds about 450
+characters). With 28 skills whose descriptions total 14k characters, every
+request carries about 5k tokens of listing either way. Short descriptions are
+the only way to lower that.
+
+The savings come from bodies: a loaded body stays in every later request until
+it is archived. In the ML skill set, bodies have a median of 5.7k characters and
+a maximum of 34k characters.
+
+### Eviction
+
+Before each user prompt, loaded bodies are scored against it:
+
+- pinned bodies are never evicted;
+- the `minKeep` most recently loaded bodies are never evicted, so the skill
+  being worked on survives replies such as "use pixi and call it housing";
+- other bodies are evicted when their relevance score is below `threshold`;
+- with `maxKeep` > 0, the oldest unprotected bodies are evicted beyond that cap.
+
+Short follow-ups and prompts on the same topic skip scoring. Scoring uses
+keyword rules from the config, then description and name overlap (stopwords
+ignored).
 
 ## Install
 
-### From the GitHub repository (cloned locally)
-
 ```bash
-git clone https://github.com/glemaitre/pi-skill-lifecycle.git
-cd pi-skill-lifecycle
-npm install                     # install dev deps (for running tests)
-pi install .                    # install the Pi package from the local clone
-```
-
-### From a local path (e.g. checkout in your workspace)
-
-```bash
-pi install ./pi-skill-lifecycle
-```
-
-### From GitHub directly
-
-```bash
+pi install ./pi-skill-lifecycle          # local checkout
 pi install git:github.com/glemaitre/pi-skill-lifecycle
+pi --extension ./pi-skill-lifecycle/extensions/index.ts   # try once
 ```
 
-### Try once without installing
+## Configuration
 
-```bash
-pi --extension ./pi-skill-lifecycle/extensions/index.ts
-```
-
-## Usage
-
-### Commands
-
-| Command | Description |
-|---|---|
-| `/skills-pin <name>` | Pin a skill so it's always kept |
-| `/skills-unpin <name>` | Unpin a previously pinned skill |
-| `/skills-list` | Show all known skills with their pinned status |
-| `/skills-reload` | Reload `skill-lifecycle.json` config from disk |
-| `/skills-on` | Re-enable automatic filtering (default) |
-| `/skills-off` | Disable filtering — all skills visible |
-
-### Configuration
-
-Place a `skill-lifecycle.json` in your project root:
+`skill-lifecycle.json` in the project root (where Pi is started):
 
 ```json
 {
+  "entrySkill": "triage-ml-task",
   "threshold": 0.15,
   "minKeep": 2,
   "maxKeep": 0,
-  "verbose": true,
-  "pinned": ["build-ml-pipeline"],
+  "pinned": [],
   "rules": [
-    {
-      "skillName": "explore-ml-data",
-      "keywords": ["explore", "eda", "profile", "data analysis", "understand data"],
-      "weight": 1.5
-    },
-    {
-      "skillName": "build-ml-pipeline",
-      "keywords": ["pipeline", "model", "classifier", "regressor", "training", "fit"]
-    },
-    {
-      "skillName": "evaluate-ml-pipeline",
-      "keywords": ["evaluate", "cross-val", "cv", "score", "metric", "cross_validate"]
-    },
-    {
-      "skillName": "audit-ml-pipeline",
-      "keywords": ["audit", "report", "narrative", "review experiment", "skore"]
-    },
-    {
-      "skillName": "frame-ml-problem",
-      "keywords": ["metric to compare", "baseline", "split", "fold", "problem type"]
-    },
-    {
-      "skillName": "smoke-test-ml-pipeline",
-      "keywords": ["smoke test", "pytest", "test pipeline"]
-    },
-    {
-      "skillName": "manage-ml-backlog",
-      "keywords": ["backlog", "idea", "triage", "next experiment", "promote"]
-    }
+    { "skillName": "explore-ml-data", "keywords": ["explore", "eda", "profile"], "weight": 1.5 }
   ]
 }
 ```
 
-### Options
-
-| Field | Default | Description |
+| Option | Default | Description |
 |---|---|---|
-| `threshold` | `0.15` | Minimum score (0–1) a skill needs to stay loaded |
-| `minKeep` | `2` | Minimum number of skills to always keep |
-| `maxKeep` | `0` | Maximum skills to keep (0 = unlimited) |
-| `verbose` | `true` | Show notifications when skills are loaded/unloaded |
-| `pinned` | `[]` | Skills always kept, regardless of prompt |
-| `rules` | `[]` | Keyword rules mapping skill names to trigger keywords |
+| `entrySkill` | `""` | Skill to load first for ambiguous requests; mentioned only if installed |
+| `blockDirectSkillReads` | `true` | Block `read` on a known SKILL.md and point to the `skill` tool |
+| `threshold` | `0.15` | Minimum relevance score (0..1) for an unprotected body to stay |
+| `minKeep` | `2` | The N most recently loaded bodies are never evicted |
+| `maxKeep` | `0` | Maximum number of loaded bodies (0 = unlimited) |
+| `pinned` | `[]` | Skills whose bodies are never evicted |
+| `rules` | `[]` | Keyword rules per skill (`skillName`, `keywords`, optional `weight`) |
+| `verbose` | `true` | Notify when bodies are loaded or archived |
+| `skipOnShortPrompts` | `true` | Skip scoring for very short follow-ups |
+| `minScorablePromptLength` | `15` | Prompts shorter than this skip scoring |
+| `topicChangeThreshold` | `0.7` | Token overlap above which a prompt counts as the same topic |
+
+An invalid config file is reported and ignored.
+
+### Use with the ML skill set
+
+The config is read from the directory where Pi starts, not from this package.
+Copy the bundled [`skill-lifecycle.json`](skill-lifecycle.json) to the root of
+the ML workspace so ambiguous requests go through `triage-ml-task` and the
+keyword rules apply:
+
+```bash
+cp pi-skill-lifecycle/skill-lifecycle.json path/to/ml-workspace/
+```
+
+Without it, the protocol still applies, but no entry skill is named.
+
+## Commands
+
+| Command | Description |
+|---|---|
+| `/skills-pin <name>` | Never archive this skill's body (this session) |
+| `/skills-unpin <name>` | Undo `/skills-pin` |
+| `/skills-list` | Known skills with pinned and loaded status |
+| `/skills-reload` | Reload `skill-lifecycle.json` |
+| `/skills-on` / `/skills-off` | Enable or disable archiving |
+
+## Limitations
+
+- `bash` commands such as `cat SKILL.md` are not intercepted.
+- Bodies loaded with `/skill:name` are injected by Pi into the user message and
+  are not archived.
+- Archiving a body changes an earlier message, so the provider's prompt cache is
+  invalidated from that point once, on the request where the body is archived.
+- `/skills-pin` pins last for the session; use `pinned` in the config to persist.
 
 ## Development
 
 ```bash
-# Clone / cd into the package directory
-cd pi-skill-lifecycle
-
-# Install dev deps
 npm install
-
-# Run tests
-npm test
-
-# Watch mode
-npm run test:watch
+npm run typecheck
+npm test            # unit + extension tests (fake API, Pi's real prompt builder)
+npm run test:e2e    # real Pi process with an offline scripted provider
+                    # PI_BIN=/path/to/pi selects the Pi executable
 ```
 
-## Design
-
 ```
-pi-skill-lifecycle/
-├── extensions/
-│   ├── index.ts        # Pi extension entry point — event hooks & commands
-│   └── rules.ts        # Pure logic — scoring, filtering, config (no Pi imports)
-├── tests/
-│   └── rules.test.ts   # Unit tests for the relevance engine
-├── package.json
-├── tsconfig.json
-└── README.md
-```
-
-The relevance engine in `rules.ts` is pure TypeScript with zero dependencies — it can be tested, reused, or embedded elsewhere without Pi.
-
-## Publishing
-
-To publish to npm:
-
-```bash
-# Make sure package.json has your details
-npm publish
-```
-
-Then users install with:
-
-```bash
-pi install npm:pi-skill-lifecycle
+extensions/index.ts         events, skill tool, commands
+extensions/rules.ts         pure logic: scoring, eviction, config
+tests/rules.test.ts         rules.ts
+tests/extension.test.ts     extension through a fake ExtensionAPI
+tests/e2e/                  scripted provider + end-to-end test
 ```

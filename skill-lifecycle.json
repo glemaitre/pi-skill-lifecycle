@@ -1,114 +1,39 @@
 {
-  "$schema": "./skill-lifecycle-schema.json",
+  "entrySkill": "triage-ml-task",
+  "blockDirectSkillReads": true,
   "threshold": 0.15,
   "minKeep": 2,
   "maxKeep": 0,
   "verbose": true,
   "pinned": [],
-  "stickyThreshold": 3,
   "skipOnShortPrompts": true,
   "minScorablePromptLength": 15,
   "topicChangeThreshold": 0.7,
   "rules": [
-    {
-      "skillName": "build-ml-pipeline",
-      "keywords": ["pipeline", "model", "classifier", "regressor", "training", "fit", "estimator"]
-    },
-    {
-      "skillName": "explore-ml-data",
-      "keywords": ["explore", "eda", "profile", "data analysis", "understand data", "statistics", "distribution"]
-    },
-    {
-      "skillName": "evaluate-ml-pipeline",
-      "keywords": ["evaluate", "cross-val", "cv", "score", "metric", "cross_validate", "generalization"]
-    },
-    {
-      "skillName": "audit-ml-pipeline",
-      "keywords": ["audit", "report", "narrative", "review experiment", "skore", "persisted"]
-    },
-    {
-      "skillName": "model-ml-pipeline",
-      "keywords": ["model", "experiment", "design", "try", "candidate", "proposal"]
-    },
-    {
-      "skillName": "frame-ml-problem",
-      "keywords": ["metric to compare", "baseline", "split", "fold", "problem type", "deployment"]
-    },
-    {
-      "skillName": "smoke-test-ml-pipeline",
-      "keywords": ["smoke test", "pytest", "test pipeline", "regression test"]
-    },
-    {
-      "skillName": "manage-ml-backlog",
-      "keywords": ["backlog", "idea", "triage", "next experiment", "promote", "history"]
-    },
-    {
-      "skillName": "review-ml-experiment",
-      "keywords": ["review", "findings", "candidate", "next step", "idea file"]
-    },
-    {
-      "skillName": "search-ml-literature",
-      "keywords": ["search", "literature", "paper", "research", "scientific"]
-    },
-    {
-      "skillName": "shape-user-idea",
-      "keywords": ["idea", "shape", "refine", "proposal"]
-    },
-    {
-      "skillName": "setup-ml-project",
-      "keywords": ["setup", "bootstrap", "scaffold", "new project", "initialize"]
-    },
-    {
-      "skillName": "setup-python-env",
-      "keywords": ["environment", "pixi", "uv", "python env", "conda", "install"]
-    },
-    {
-      "skillName": "setup-workspace",
-      "keywords": ["workspace", "scaffold", "new project", "cookiecutter", "layout"]
-    },
-    {
-      "skillName": "setup-git",
-      "keywords": ["git", "commit", "version control", "init"]
-    },
-    {
-      "skillName": "export-ml-notebook",
-      "keywords": ["notebook", "ipynb", "export", "html", "execute"]
-    },
-    {
-      "skillName": "export-ml-site",
-      "keywords": ["site", "mkdocs", "documentation", "website", "docs"]
-    },
-    {
-      "skillName": "sync-ml-reports",
-      "keywords": ["sync", "hub", "mlflow", "upload", "migrate", "skore"]
-    },
-    {
-      "skillName": "research-ml-practice",
-      "keywords": ["research", "leakage", "feature engineering", "methodology", "best practice"]
-    },
-    {
-      "skillName": "plot-ml-figure",
-      "keywords": ["plot", "chart", "figure", "visualize", "graph", "matplotlib"]
-    },
-    {
-      "skillName": "choose-python-library",
-      "keywords": ["choose", "library", "dependency", "which package"]
-    },
-    {
-      "skillName": "add-python-package",
-      "keywords": ["install", "package", "dependency", "add", "pip", "pixi"]
-    },
-    {
-      "skillName": "review-ml-choices",
-      "keywords": ["review", "choices", "settings", "what we decided", "change"]
-    },
-    {
-      "skillName": "persist-ml-git",
-      "keywords": ["commit", "stage", "git", "persist"]
-    },
-    {
-      "skillName": "triage-ml-task",
-      "keywords": ["triage", "what next", "ambiguous", "where to start", "entry"]
-    }
+    { "skillName": "build-ml-pipeline", "keywords": ["pipeline", "model", "classifier", "regressor", "training", "fit", "estimator"] },
+    { "skillName": "explore-ml-data", "keywords": ["explore", "eda", "profile", "data analysis", "understand data", "statistics", "distribution"] },
+    { "skillName": "evaluate-ml-pipeline", "keywords": ["evaluate", "cross-val", "cv", "score", "metric", "cross_validate", "generalization"] },
+    { "skillName": "audit-ml-pipeline", "keywords": ["audit", "report", "narrative", "review experiment", "skore", "persisted"] },
+    { "skillName": "model-ml-pipeline", "keywords": ["model", "experiment", "design", "try", "candidate", "proposal"] },
+    { "skillName": "frame-ml-problem", "keywords": ["metric to compare", "baseline", "split", "fold", "problem type", "deployment"] },
+    { "skillName": "smoke-test-ml-pipeline", "keywords": ["smoke test", "pytest", "test pipeline", "regression test"] },
+    { "skillName": "manage-ml-backlog", "keywords": ["backlog", "idea", "triage", "next experiment", "promote", "history"] },
+    { "skillName": "review-ml-experiment", "keywords": ["review", "findings", "candidate", "next step", "idea file"] },
+    { "skillName": "search-ml-literature", "keywords": ["search", "literature", "paper", "research", "scientific"] },
+    { "skillName": "shape-user-idea", "keywords": ["idea", "shape", "refine", "proposal"] },
+    { "skillName": "setup-ml-project", "keywords": ["setup", "bootstrap", "scaffold", "new project", "initialize"] },
+    { "skillName": "setup-python-env", "keywords": ["environment", "pixi", "uv", "python env", "conda", "install"] },
+    { "skillName": "setup-workspace", "keywords": ["workspace", "scaffold", "new project", "cookiecutter", "layout"] },
+    { "skillName": "setup-git", "keywords": ["git", "commit", "version control", "init"] },
+    { "skillName": "export-ml-notebook", "keywords": ["notebook", "ipynb", "export", "html", "execute"] },
+    { "skillName": "export-ml-site", "keywords": ["site", "mkdocs", "documentation", "website", "docs"] },
+    { "skillName": "sync-ml-reports", "keywords": ["sync", "hub", "mlflow", "upload", "migrate", "skore"] },
+    { "skillName": "research-ml-practice", "keywords": ["research", "leakage", "feature engineering", "methodology", "best practice"] },
+    { "skillName": "plot-ml-figure", "keywords": ["plot", "chart", "figure", "visualize", "graph", "matplotlib"] },
+    { "skillName": "choose-python-library", "keywords": ["choose", "library", "dependency", "which package"] },
+    { "skillName": "add-python-package", "keywords": ["install", "package", "dependency", "add", "pip", "pixi"] },
+    { "skillName": "review-ml-choices", "keywords": ["review", "choices", "settings", "what we decided", "change"] },
+    { "skillName": "persist-ml-git", "keywords": ["commit", "stage", "git", "persist"] },
+    { "skillName": "triage-ml-task", "keywords": ["triage", "what next", "ambiguous", "where to start", "entry"] }
   ]
 }

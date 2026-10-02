@@ -19,4 +19,11 @@ jobs:
 
       - run: npm install
 
+      - run: npm run typecheck
+
       - run: npm test
+
+      # Real Pi process with an offline scripted provider (no API keys needed).
+      - run: npm run test:e2e
+        env:
+          PI_BIN: ${{ github.workspace }}/node_modules/.bin/pi

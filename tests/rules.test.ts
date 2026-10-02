@@ -17,6 +17,7 @@ import {
   fingerprintPrompt,
   extractSkillNameFromContent,
   buildPlaceholder,
+  selectBodiesToEvict,
 } from "../extensions/rules.ts";
 import type { Skill, RelevanceRule } from "../extensions/rules.ts";
 
@@ -49,8 +50,13 @@ describe("tokenize", () => {
   });
 
   it("excludes words shorter than 3 characters", () => {
-    const t = tokenize("a an the of for ml pi");
-    expect([...t]).toEqual(["the", "for"]);
+    const t = tokenize("a an of ml pi data");
+    expect([...t]).toEqual(["data"]);
+  });
+
+  it("excludes stopwords so filler words do not count as overlap", () => {
+    const t = tokenize("the data and the pipeline for you");
+    expect([...t]).toEqual(["data", "pipeline"]);
   });
 
   it("lowercases everything", () => {
@@ -266,7 +272,8 @@ describe("configWithDefaults", () => {
     expect(cfg.minKeep).toBe(DEFAULT_CONFIG.minKeep);
     expect(cfg.rules).toEqual([]);
     expect(cfg.pinned).toEqual([]);
-    expect(cfg.stickyThreshold).toBe(3);
+    expect(cfg.entrySkill).toBe("");
+    expect(cfg.blockDirectSkillReads).toBe(true);
     expect(cfg.skipOnShortPrompts).toBe(true);
     expect(cfg.minScorablePromptLength).toBe(15);
     expect(cfg.topicChangeThreshold).toBe(0.7);
@@ -278,8 +285,14 @@ describe("configWithDefaults", () => {
     expect(cfg.minKeep).toBe(DEFAULT_CONFIG.minKeep);
     expect(cfg.pinned).toEqual(["test"]);
     expect(cfg.rules).toEqual([]);
-    expect(cfg.stickyThreshold).toBe(3);
+    expect(cfg.blockDirectSkillReads).toBe(true);
     expect(cfg.skipOnShortPrompts).toBe(true);
+  });
+
+  it("keeps explicit false and empty values", () => {
+    const cfg = configWithDefaults({ blockDirectSkillReads: false, entrySkill: "triage-ml-task" });
+    expect(cfg.blockDirectSkillReads).toBe(false);
+    expect(cfg.entrySkill).toBe("triage-ml-task");
   });
 });
 
@@ -428,5 +441,57 @@ describe("buildPlaceholder", () => {
     const result = buildPlaceholder("test-skill");
     expect(result).toMatch(/^<skill_content/);
     expect(result).toMatch(/<\/skill_content>$/);
+  });
+});
+// ── selectBodiesToEvict ───────────────────────────────────────────
+
+describe("selectBodiesToEvict", () => {
+  const skills = new Map(
+    [
+      makeSkill({ name: "explore-ml-data", description: "Explore and profile the data" }),
+      makeSkill({ name: "setup-ml-project", description: "Set up and bootstrap a workspace" }),
+      makeSkill({ name: "build-ml-pipeline", description: "Build a skrub pipeline" }),
+    ].map((s) => [s.name, s]),
+  );
+  const loaded = [
+    { name: "explore-ml-data", seq: 1 },
+    { name: "setup-ml-project", seq: 2 },
+    { name: "build-ml-pipeline", seq: 3 },
+  ];
+  const names = (out: Array<{ name: string }>) => out.map((e) => e.name).sort();
+
+  it("protects the minKeep most recent bodies even with no keyword match", () => {
+    const out = selectBodiesToEvict("unrelated words here", loaded, skills, new Set(), configWithDefaults({ minKeep: 2 }));
+    expect(names(out)).toEqual(["explore-ml-data"]);
+  });
+
+  it("keeps an old body that is still relevant", () => {
+    const out = selectBodiesToEvict("explore the data again", loaded, skills, new Set(), configWithDefaults({ minKeep: 1 }));
+    expect(names(out)).toEqual(["setup-ml-project"]);
+  });
+
+  it("never evicts pinned bodies", () => {
+    const out = selectBodiesToEvict("unrelated", loaded, skills, new Set(["explore-ml-data"]), configWithDefaults({ minKeep: 0 }));
+    expect(names(out)).toEqual(["build-ml-pipeline", "setup-ml-project"]);
+  });
+
+  it("evicts bodies of skills that are no longer installed", () => {
+    const out = selectBodiesToEvict("explore", [{ name: "gone", seq: 0 }, ...loaded], skills, new Set(), configWithDefaults({ minKeep: 3 }));
+    expect(names(out)).toEqual(["gone"]);
+  });
+
+  it("caps the total with maxKeep by evicting the oldest unprotected survivors", () => {
+    const out = selectBodiesToEvict(
+      "explore data, set up workspace, build pipeline",
+      loaded,
+      skills,
+      new Set(),
+      configWithDefaults({ minKeep: 1, maxKeep: 2 }),
+    );
+    expect(out).toEqual([{ name: "explore-ml-data", score: 0, reason: "over maxKeep (2)" }]);
+  });
+
+  it("returns nothing when nothing is loaded", () => {
+    expect(selectBodiesToEvict("x", [], skills, new Set(), configWithDefaults())).toEqual([]);
   });
 });
