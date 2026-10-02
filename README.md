@@ -15,14 +15,30 @@ Pinned skills (via config or `/skills-pin`) are always kept.
 
 ## Install
 
+### From the GitHub repository (cloned locally)
+
 ```bash
-# From a local path
+git clone https://github.com/glemaitre/pi-skill-lifecycle.git
+cd pi-skill-lifecycle
+npm install                     # install dev deps (for running tests)
+pi install .                    # install the Pi package from the local clone
+```
+
+### From a local path (e.g. checkout in your workspace)
+
+```bash
 pi install ./pi-skill-lifecycle
+```
 
-# From git
-pi install git:github.com/yourname/pi-skill-lifecycle
+### From GitHub directly
 
-# Try once without installing
+```bash
+pi install git:github.com/glemaitre/pi-skill-lifecycle
+```
+
+### Try once without installing
+
+```bash
 pi --extension ./pi-skill-lifecycle/extensions/index.ts
 ```
 
