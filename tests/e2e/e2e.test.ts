@@ -46,7 +46,13 @@ describe.skipIf(!process.env.PI_E2E)("pi end-to-end", () => {
       ],
       {
         cwd: workspace,
-        env: { ...process.env, E2E_LOG: join(workspace, "requests.jsonl"), E2E_SCRIPT: JSON.stringify(SCRIPT) },
+        env: {
+          ...process.env,
+          // Fresh agent dir: no user settings, packages, or config leak into the run.
+          PI_CODING_AGENT_DIR: join(workspace, "agent"),
+          E2E_LOG: join(workspace, "requests.jsonl"),
+          E2E_SCRIPT: JSON.stringify(SCRIPT),
+        },
         stdio: "pipe",
         timeout: 60_000,
       },
@@ -60,7 +66,8 @@ describe.skipIf(!process.env.PI_E2E)("pi end-to-end", () => {
       mkdirSync(dir, { recursive: true });
       writeFileSync(join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: ${description}\n---\n\n# ${name}\n\n${"Instructions. ".repeat(400)}\n`);
     }
-    writeFileSync(join(workspace, "skill-lifecycle.json"), JSON.stringify({ entrySkill: "triage-ml-task", minKeep: 1 }));
+    mkdirSync(join(workspace, ".pi"), { recursive: true });
+    writeFileSync(join(workspace, ".pi", "skill-lifecycle.json"), JSON.stringify({ entrySkill: "triage-ml-task", minKeep: 1 }));
 
     runPi("I would like to explore the data");
     runPi("now set up the project workspace", ["--continue"]);

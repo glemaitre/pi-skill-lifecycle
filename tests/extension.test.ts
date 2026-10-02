@@ -60,7 +60,12 @@ const SPECS: SkillSpec[] = [
   { name: "hidden-skill", description: "Only invoked by an explicit command.", disableModelInvocation: true },
 ];
 
-function createHarness(cwd: string, skills: PiSkill[], activeTools = ["read", "bash", "edit", "write", "skill"]) {
+function createHarness(
+  cwd: string,
+  skills: PiSkill[],
+  activeTools = ["read", "bash", "edit", "write", "skill"],
+  trusted = true,
+) {
   const handlers = new Map<string, Handler[]>();
   const tools = new Map<string, any>();
   const commands = new Map<string, any>();
@@ -91,6 +96,7 @@ function createHarness(cwd: string, skills: PiSkill[], activeTools = ["read", "b
     mode: "tui",
     ui: { notify: (message: string) => notifications.push(message) },
     sessionManager: { getBranch: () => branch },
+    isProjectTrusted: () => trusted,
   };
 
   async function emit(event: string, payload: any) {
@@ -167,20 +173,33 @@ function isPlaceholder(message: any): boolean {
 // ── Tests ─────────────────────────────────────────────────────────
 
 let root: string;
+let agentDir: string;
 let skills: PiSkill[];
+const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "skill-lifecycle-"));
+  // Isolate from the developer's real ~/.pi/agent.
+  agentDir = mkdtempSync(join(tmpdir(), "skill-lifecycle-agent-"));
+  process.env.PI_CODING_AGENT_DIR = agentDir;
   skills = writeSkills(root, SPECS);
 });
 
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });
+  rmSync(agentDir, { recursive: true, force: true });
+  if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
 });
 
-async function startSession(config?: object, activeTools?: string[]) {
-  if (config) writeFileSync(join(root, "skill-lifecycle.json"), JSON.stringify(config));
-  const harness = createHarness(root, skills, activeTools);
+function writeProjectConfig(config: object) {
+  mkdirSync(join(root, ".pi"), { recursive: true });
+  writeFileSync(join(root, ".pi", "skill-lifecycle.json"), JSON.stringify(config));
+}
+
+async function startSession(config?: object, activeTools?: string[], trusted = true) {
+  if (config) writeProjectConfig(config);
+  const harness = createHarness(root, skills, activeTools, trusted);
   await harness.emit("session_start", { type: "session_start", reason: "startup" });
   return harness;
 }
@@ -217,7 +236,7 @@ describe("system prompt", () => {
     const missingEntry = await startSession({ entrySkill: "does-not-exist" });
     expect((await missingEntry.prompt("hi")).sections.skills).not.toContain("does-not-exist");
 
-    rmSync(join(root, "skill-lifecycle.json"));
+    rmSync(join(root, ".pi", "skill-lifecycle.json"));
     const noEntry = await startSession();
     expect((await noEntry.prompt("hi")).sections.skills).not.toContain("triage-ml-task\")");
   });
@@ -378,5 +397,62 @@ describe("direct SKILL.md reads", () => {
       input: { path: ".agents/skills/explore-ml-data/SKILL.md" },
     });
     expect(result?.block).toBeFalsy();
+  });
+});
+
+describe("config location", () => {
+  it("reads the user config from the agent directory", async () => {
+    writeFileSync(join(agentDir, "skill-lifecycle.json"), JSON.stringify({ entrySkill: "triage-ml-task" }));
+    const h = await startSession();
+    expect((await h.prompt("hi")).sections.skills).toContain('skill("triage-ml-task")');
+  });
+
+  it("lets the project .pi config override the user config key by key", async () => {
+    writeFileSync(
+      join(agentDir, "skill-lifecycle.json"),
+      JSON.stringify({ entrySkill: "triage-ml-task", blockDirectSkillReads: false }),
+    );
+    const h = await startSession({ entrySkill: "setup-ml-project" });
+    const { sections } = await h.prompt("explore the data");
+    expect(sections.skills).toContain('skill("setup-ml-project")');
+    expect(sections.skills).not.toContain('skill("triage-ml-task")');
+    // Not overridden by the project file, so the user value still applies.
+    const result = await h.emit("tool_call", {
+      type: "tool_call",
+      toolCallId: "c1",
+      toolName: "read",
+      input: { path: ".agents/skills/explore-ml-data/SKILL.md" },
+    });
+    expect(result?.block).toBeFalsy();
+  });
+
+  it("ignores the project config until the project is trusted, and says so", async () => {
+    const h = await startSession({ entrySkill: "triage-ml-task" }, undefined, false);
+    expect((await h.prompt("hi")).sections.skills).not.toContain('skill("triage-ml-task")');
+    expect(h.notifications.some((n) => n.includes("ignored until the project is trusted"))).toBe(true);
+  });
+
+  it("no longer reads skill-lifecycle.json from the working directory root", async () => {
+    writeFileSync(join(root, "skill-lifecycle.json"), JSON.stringify({ entrySkill: "triage-ml-task" }));
+    const h = await startSession();
+    expect((await h.prompt("hi")).sections.skills).not.toContain('skill("triage-ml-task")');
+  });
+
+  it("reports an invalid config file and falls back to defaults", async () => {
+    mkdirSync(join(root, ".pi"), { recursive: true });
+    writeFileSync(join(root, ".pi", "skill-lifecycle.json"), "{ not json");
+    const h = await startSession();
+    await h.prompt("hi");
+    expect(h.notifications.some((n) => n.includes("ignoring invalid"))).toBe(true);
+  });
+
+  it("lists the config sources in /skills-list", async () => {
+    writeFileSync(join(agentDir, "skill-lifecycle.json"), "{}");
+    const h = await startSession({ minKeep: 1 });
+    await h.prompt("hi");
+    await h.commands.get("skills-list").handler("", h.ctx);
+    const listing = h.notifications.at(-1)!;
+    expect(listing).toContain(join(agentDir, "skill-lifecycle.json"));
+    expect(listing).toContain(join(root, ".pi", "skill-lifecycle.json"));
   });
 });

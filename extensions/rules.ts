@@ -276,14 +276,11 @@ export function selectRelevantSkills(
 // ── Config file loading ───────────────────────────────────────────
 
 /**
- * Default config file path (relative to workspace root).
+ * Config file name, looked up in the user agent directory and the project
+ * `.pi` directory (see `configPaths` in index.ts).
  */
 export const CONFIG_FILENAME = "skill-lifecycle.json";
 
-/**
- * Try to load engine config from a JSON file.
- * Returns undefined if the file doesn't exist or is unreadable.
- */
 // ── Change detection ────────────────────────────────────────────
 
 /**
@@ -335,22 +332,6 @@ export function isMinorChange(
   const overlapRatio = overlapCount / currentTokens.size;
 
   return overlapRatio >= config.topicChangeThreshold;
-}
-
-export async function loadConfigFromFile(
-  cwd: string,
-  filename: string = CONFIG_FILENAME,
-): Promise<EngineConfig | undefined> {
-  // We use a dynamic import so this module remains dependency-free.
-  // In a pi extension, fs is always available.
-  try {
-    const fs = await import("node:fs/promises");
-    const content = await fs.readFile(`${cwd}/${filename}`, "utf-8");
-    const parsed = JSON.parse(content) as EngineConfig;
-    return parsed;
-  } catch {
-    return undefined;
-  }
 }
 
 /**

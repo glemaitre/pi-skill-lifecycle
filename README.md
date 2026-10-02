@@ -71,7 +71,19 @@ pi --extension ./pi-skill-lifecycle/extensions/index.ts   # try once
 
 ## Configuration
 
-`skill-lifecycle.json` in the project root (where Pi is started):
+The extension reads `skill-lifecycle.json` from Pi's configuration directories,
+like Pi's own `mcp.json`:
+
+| File | Scope |
+|---|---|
+| `~/.pi/agent/skill-lifecycle.json` | Every project (follows `PI_CODING_AGENT_DIR`) |
+| `.pi/skill-lifecycle.json` | This project; read only once the project is [trusted](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/security.md) |
+
+Both are optional. Project keys override user keys one by one (a project
+`rules` list replaces the user list). `/skills-list` shows which files were
+read; `/skills-reload` rereads them.
+
+Example:
 
 ```json
 {
@@ -100,18 +112,21 @@ pi --extension ./pi-skill-lifecycle/extensions/index.ts   # try once
 | `minScorablePromptLength` | `15` | Prompts shorter than this skip scoring |
 | `topicChangeThreshold` | `0.7` | Token overlap above which a prompt counts as the same topic |
 
-An invalid config file is reported and ignored.
+An invalid config file is reported and ignored. A `skill-lifecycle.json` at the
+root of the working directory is not read.
 
 ### Use with the ML skill set
 
-The config is read from the directory where Pi starts, not from this package.
-Copy the bundled [`skill-lifecycle.json`](skill-lifecycle.json) to the root of
-the ML workspace so ambiguous requests go through `triage-ml-task` and the
-keyword rules apply:
+Copy the bundled [`skill-lifecycle.json`](skill-lifecycle.json) into the ML
+workspace's `.pi/` directory so ambiguous requests go through `triage-ml-task`
+and the keyword rules apply:
 
 ```bash
-cp pi-skill-lifecycle/skill-lifecycle.json path/to/ml-workspace/
+mkdir -p path/to/ml-workspace/.pi
+cp pi-skill-lifecycle/skill-lifecycle.json path/to/ml-workspace/.pi/
 ```
+
+To use it in every project instead, copy it to `~/.pi/agent/`.
 
 Without it, the protocol still applies, but no entry skill is named.
 

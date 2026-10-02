@@ -19,6 +19,7 @@
 import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, Skill as PiSkill } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { EngineConfig, Skill } from "./rules.ts";
@@ -33,6 +34,19 @@ import {
 } from "./rules.ts";
 
 const SKILL_TOOL = "skill";
+
+/**
+ * Config locations, lowest precedence first: the user agent directory
+ * (`~/.pi/agent`, or `PI_CODING_AGENT_DIR`), then the project `.pi` directory.
+ * The project file is read only when the project is trusted, like the rest
+ * of Pi's project configuration.
+ */
+export function configPaths(cwd: string): { user: string; project: string } {
+  return {
+    user: path.join(getAgentDir(), CONFIG_FILENAME),
+    project: path.join(cwd, CONFIG_DIR_NAME, CONFIG_FILENAME),
+  };
+}
 const MAX_LISTED_FILES = 10;
 
 // ── Rendering ─────────────────────────────────────────────────────
@@ -114,6 +128,8 @@ export default function (pi: ExtensionAPI) {
   const userPins = new Set<string>();
   let enabled = true;
   let config = configWithDefaults();
+  /** Config files that were read, for /skills-list. */
+  let configSources: string[] = [];
   let prevFingerprint: ReturnType<typeof fingerprintPrompt> | undefined;
 
   const pinned = () => new Set([...configPins, ...userPins]);
@@ -124,16 +140,41 @@ export default function (pi: ExtensionAPI) {
     loaded.set(name, ++seq);
   }
 
-  async function reloadConfig(cwd: string, ctx?: ExtensionContext): Promise<void> {
-    let parsed: EngineConfig | undefined;
+  /** Read one config file; undefined when it is missing or invalid (invalid files are reported). */
+  async function readConfigFile(file: string, ctx: ExtensionContext): Promise<EngineConfig | undefined> {
+    let text: string;
     try {
-      parsed = JSON.parse(await readFile(path.join(cwd, CONFIG_FILENAME), "utf-8")) as EngineConfig;
+      text = await readFile(file, "utf-8");
     } catch (err: any) {
-      if (err?.code !== "ENOENT" && ctx?.hasUI) {
-        ctx.ui.notify(`skill-lifecycle: ignoring invalid ${CONFIG_FILENAME}: ${err?.message ?? err}`, "warning");
-      }
+      if (err?.code !== "ENOENT") warn(ctx, `cannot read ${file}: ${err?.message ?? err}`);
+      return undefined;
     }
-    config = configWithDefaults(parsed);
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as EngineConfig;
+      warn(ctx, `ignoring ${file}: expected a JSON object`);
+    } catch (err: any) {
+      warn(ctx, `ignoring invalid ${file}: ${err?.message ?? err}`);
+    }
+    return undefined;
+  }
+
+  function warn(ctx: ExtensionContext, message: string) {
+    if (ctx.hasUI) ctx.ui.notify(`skill-lifecycle: ${message}`, "warning");
+  }
+
+  /** Merge the user and project config files; project keys override user keys. */
+  async function reloadConfig(ctx: ExtensionContext): Promise<void> {
+    const paths = configPaths(ctx.cwd);
+    const user = await readConfigFile(paths.user, ctx);
+    let project: EngineConfig | undefined;
+    if (ctx.isProjectTrusted()) {
+      project = await readConfigFile(paths.project, ctx);
+    } else if (await readFile(paths.project).then(() => true, () => false)) {
+      warn(ctx, `${paths.project} is ignored until the project is trusted`);
+    }
+    configSources = [user && paths.user, project && paths.project].filter((p): p is string => !!p);
+    config = configWithDefaults({ ...user, ...project });
     configPins = new Set(config.pinned.map((name) => name.toLowerCase()));
   }
 
@@ -156,7 +197,7 @@ export default function (pi: ExtensionAPI) {
   // ── Session events ──────────────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
-    await reloadConfig(ctx.cwd, ctx);
+    await reloadConfig(ctx);
     prevFingerprint = undefined;
     rebuildFromBranch(ctx);
   });
@@ -323,7 +364,7 @@ export default function (pi: ExtensionAPI) {
       const name = args.trim().toLowerCase();
       if (!name) return ctx.ui.notify("Usage: /skills-unpin <skill-name>", "warning");
       if (configPins.has(name)) {
-        return ctx.ui.notify(`${name} is pinned in ${CONFIG_FILENAME}; remove it there`, "warning");
+        return ctx.ui.notify(`${name} is pinned in ${configSources.join(" or ")}; remove it there`, "warning");
       }
       if (!userPins.delete(name)) return ctx.ui.notify(`Skill not pinned: ${name}`, "warning");
       ctx.ui.notify(`📍 Unpinned: ${name}`, "info");
@@ -343,6 +384,7 @@ export default function (pi: ExtensionAPI) {
           `Skills (${skillsByName.size}) — eviction ${enabled ? "on" : "off"}; loaded: ${[...loaded.keys()].join(", ") || "none"}`,
           ...(skillsByName.size === 0 ? ["  (list is filled on the first prompt)"] : lines),
           "📌 pinned   📖 body loaded",
+          `Config: ${configSources.join(" + ") || "defaults"}`,
         ].join("\n"),
         "info",
       );
@@ -350,10 +392,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("skills-reload", {
-    description: `Reload ${CONFIG_FILENAME} from disk`,
+    description: `Reload ${CONFIG_FILENAME} from the user and project config directories`,
     handler: async (_args, ctx) => {
-      await reloadConfig(ctx.cwd, ctx);
-      ctx.ui.notify(`🔄 Reloaded ${CONFIG_FILENAME}`, "info");
+      await reloadConfig(ctx);
+      ctx.ui.notify(`🔄 Config: ${configSources.join(" + ") || "defaults (no config file)"}`, "info");
     },
   });
 
