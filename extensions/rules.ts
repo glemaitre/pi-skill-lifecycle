@@ -51,6 +51,12 @@ export interface EngineConfig {
    * Default: "" (none).
    */
   entrySkill?: string;
+  /**
+   * Never archive the entry skill's body. The protocol sends the model back
+   * to the entry skill after every stage, so archiving it only forces
+   * reloads. Only applies when `entrySkill` is set. Default: true
+   */
+  pinEntrySkill?: boolean;
   /** Block `read` calls on a known SKILL.md and point to the skill tool. Default: true */
   blockDirectSkillReads?: boolean;
   /**
@@ -59,6 +65,14 @@ export interface EngineConfig {
    * user prompt. Default: true
    */
   evictOnSkillLoad?: boolean;
+  /**
+   * Skills that a workflow calls for a sub-step (for example
+   * `choose-python-library` or `persist-ml-git`). Loading one of them in the
+   * middle of a run never archives other bodies, so the calling skill keeps
+   * its instructions. Helper bodies are archived like any other body when a
+   * non-helper skill is loaded later, or at user prompts. Default: [] (none).
+   */
+  helperSkills?: string[];
 
   // ── Change-detection optimisation ────────────────────────────
   /** Skip scoring when the prompt is a short follow-up. Default: true */
@@ -94,8 +108,10 @@ export const DEFAULT_CONFIG: Required<EngineConfig> = {
   pinned: [],
   verbose: true,
   entrySkill: "",
+  pinEntrySkill: true,
   blockDirectSkillReads: true,
   evictOnSkillLoad: true,
+  helperSkills: [],
   skipOnShortPrompts: true,
   minScorablePromptLength: 15,
   topicChangeThreshold: 0.7,
@@ -110,7 +126,9 @@ export function configWithDefaults(partial?: EngineConfig): Required<EngineConfi
     ...partial,
     rules: partial?.rules ?? [],
     pinned: partial?.pinned ?? [],
+    helperSkills: partial?.helperSkills ?? [],
     entrySkill: partial?.entrySkill ?? DEFAULT_CONFIG.entrySkill,
+    pinEntrySkill: partial?.pinEntrySkill ?? DEFAULT_CONFIG.pinEntrySkill,
     blockDirectSkillReads: partial?.blockDirectSkillReads ?? DEFAULT_CONFIG.blockDirectSkillReads,
     evictOnSkillLoad: partial?.evictOnSkillLoad ?? DEFAULT_CONFIG.evictOnSkillLoad,
     skipOnShortPrompts: partial?.skipOnShortPrompts ?? DEFAULT_CONFIG.skipOnShortPrompts,
@@ -391,8 +409,8 @@ export function extractSkillNameFromContent(
 export function buildPlaceholder(skillName: string): string {
   return [
     `<skill_content name="${skillName}">`,
-    `  [Previously loaded skill body — archived because the topic shifted.`,
-    `   Call \`skill("${skillName}")\` to reload when needed.]`,
+    `  [Skill body archived to save context.`,
+    `   Call \`skill("${skillName}")\` to reload it if you need its instructions again.]`,
     `</skill_content>`,
   ].join("\n");
 }
@@ -465,6 +483,9 @@ export function selectBodiesToEvict(
  * bodies are scored against the new skills' names and descriptions instead of
  * the user prompt (which led to the older skills in the first place).
  *
+ * - Helper skills (`helperSkills`) do not move the work: when every new
+ *   skill is a helper, nothing is evicted, so the calling skill keeps its
+ *   instructions. Otherwise only the non-helper skills are scored against.
  * - The newly loaded skills and pinned bodies are never evicted.
  * - `minKeep` does not apply: the new skill is the one being worked on.
  * - Other bodies are evicted when their score is below `threshold`;
@@ -478,8 +499,10 @@ export function selectBodiesSupersededBy(
   config: Required<EngineConfig>,
 ): Array<{ name: string; score: number; reason: string }> {
   const fresh = new Set(newNames);
-  if (fresh.size === 0) return [];
-  const text = [...fresh]
+  const helpers = new Set(config.helperSkills);
+  const owners = [...fresh].filter((name) => !helpers.has(name));
+  if (owners.length === 0) return [];
+  const text = owners
     .map((name) => `${name} ${skillsByName.get(name)?.description ?? ""}`)
     .join("\n");
   const protectedSet = new Set([...pinnedSet, ...fresh]);
@@ -487,6 +510,6 @@ export function selectBodiesSupersededBy(
     ...b,
     reason: b.reason.startsWith("over maxKeep") || b.reason === "skill no longer installed"
       ? b.reason
-      : `superseded by ${[...fresh].join(", ")} (${b.reason})`,
+      : `superseded by ${owners.join(", ")} (${b.reason})`,
   }));
 }

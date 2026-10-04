@@ -65,9 +65,37 @@ next request of the same run:
 - pinned bodies and the skills loaded in that turn are never evicted;
 - `minKeep` does not apply, so the new skill replaces unrelated older ones;
 - other bodies are evicted when their score is below `threshold`; `maxKeep`
-  applies as above.
+  applies as above;
+- loading a skill listed in `helperSkills` evicts nothing, so the skill that
+  called it keeps its instructions. Helper bodies are evicted like any other
+  body when a non-helper skill is loaded later.
 
 Set `evictOnSkillLoad` to `false` to only evict at user prompts.
+
+The entry skill (`entrySkill`) is pinned by default (`pinEntrySkill`): the
+protocol sends the model back to it after every stage, so archiving it only
+forces reloads.
+
+### Why helpers and the entry pin
+
+Measured by replaying 7 recorded ML sessions (about 200 to 300 requests each)
+with Anthropic price ratios (cache read 0.1×, cache write 1.25×). Each
+request is costed by prefix caching: archiving a body re-sends everything after
+it uncached once.
+
+| Strategy | Cost (relative) | Peak context | Reloads after archive |
+|---|---|---|---|
+| Keep every body (Pi default, OpenCode) | 100% | 100% | 0 |
+| Evict on every mid-run load | 93% | 83% | 46 |
+| + helpers + entry pin (bundled config) | 96% | 85% | 22 |
+
+Evicting on every load is the cheapest, but it archives the skill driving the
+work whenever it calls a helper, and the model works without those
+instructions until it reloads them. Helpers and the entry pin halve the
+reloads and keep most of the savings. Protecting the K most recent bodies
+instead costs more than keeping everything: protected bodies are evicted later
+anyway, so their cost is paid twice (re-sent on more requests, then a cache
+miss when they are archived).
 
 Short follow-ups and prompts on the same topic skip scoring. Scoring uses
 keyword rules from the config, then description and name overlap (stopwords
@@ -100,6 +128,7 @@ Example:
 ```json
 {
   "entrySkill": "triage-ml-task",
+  "helperSkills": ["choose-python-library", "persist-ml-git"],
   "threshold": 0.15,
   "minKeep": 2,
   "maxKeep": 0,
@@ -115,6 +144,8 @@ Example:
 | `entrySkill` | `""` | Skill to load first for ambiguous requests; mentioned only if installed |
 | `blockDirectSkillReads` | `true` | Block `read` on a known SKILL.md and point to the `skill` tool |
 | `evictOnSkillLoad` | `true` | Evict unrelated bodies as soon as another skill is loaded mid-run |
+| `helperSkills` | `[]` | Skills called for a sub-step; loading one mid-run evicts nothing |
+| `pinEntrySkill` | `true` | Never evict the entry skill's body |
 | `threshold` | `0.15` | Minimum relevance score (0..1) for an unprotected body to stay |
 | `minKeep` | `2` | The N most recently loaded bodies are never evicted |
 | `maxKeep` | `0` | Maximum number of loaded bodies (0 = unlimited) |
@@ -132,7 +163,7 @@ root of the working directory is not read.
 
 Copy the bundled [`skill-lifecycle.json`](skill-lifecycle.json) into the ML
 workspace's `.pi/` directory so ambiguous requests go through `triage-ml-task`
-and the keyword rules apply:
+(pinned), sub-step skills are declared as helpers, and the keyword rules apply:
 
 ```bash
 mkdir -p path/to/ml-workspace/.pi
@@ -149,7 +180,7 @@ Without it, the protocol still applies, but no entry skill is named.
 |---|---|
 | `/skills-pin <name>` | Never archive this skill's body (this session) |
 | `/skills-unpin <name>` | Undo `/skills-pin` |
-| `/skills-list` | Known skills with pinned and loaded status |
+| `/skills-list` | Known skills with pinned, loaded, and helper status |
 | `/skills-reload` | Reload `skill-lifecycle.json` |
 | `/skills-on` / `/skills-off` | Enable or disable archiving |
 

@@ -274,6 +274,8 @@ describe("configWithDefaults", () => {
     expect(cfg.rules).toEqual([]);
     expect(cfg.pinned).toEqual([]);
     expect(cfg.entrySkill).toBe("");
+    expect(cfg.pinEntrySkill).toBe(true);
+    expect(cfg.helperSkills).toEqual([]);
     expect(cfg.blockDirectSkillReads).toBe(true);
     expect(cfg.skipOnShortPrompts).toBe(true);
     expect(cfg.minScorablePromptLength).toBe(15);
@@ -429,13 +431,15 @@ describe("buildPlaceholder", () => {
     const result = buildPlaceholder("build-ml-pipeline");
     expect(result).toContain('<skill_content name="build-ml-pipeline">');
     expect(result).toContain("</skill_content>");
-    expect(result).toContain("archived because the topic shifted");
+    expect(result).toContain("archived to save context");
+    // Mid-run archives happen without a topic change; do not claim one.
+    expect(result).not.toContain("topic");
     expect(result).toContain('skill("build-ml-pipeline")');
   });
 
   it("tells the model it can reload the skill", () => {
     const result = buildPlaceholder("explore-ml-data");
-    expect(result).toContain("reload when needed");
+    expect(result).toContain("reload it if you need its instructions again");
   });
 
   it("produces valid XML-like tags", () => {
@@ -542,6 +546,40 @@ describe("selectBodiesSupersededBy", () => {
       configWithDefaults(),
     );
     expect(out).toEqual([]);
+  });
+
+  it("archives nothing when every new skill is a helper", () => {
+    const loaded = [
+      { name: "explore-ml-data", seq: 1 },
+      { name: "setup-ml-project", seq: 2 },
+    ];
+    const config = configWithDefaults({ helperSkills: ["setup-ml-project"] });
+    expect(selectBodiesSupersededBy(["setup-ml-project"], loaded, skills, new Set(), config)).toEqual([]);
+  });
+
+  it("scores against the non-helper skills only when helpers load together with an owner", () => {
+    const loaded = [
+      { name: "explore-ml-data", seq: 1 },
+      { name: "setup-ml-project", seq: 2 },
+      { name: "build-ml-pipeline", seq: 3 },
+    ];
+    // build-ml-pipeline's description shares "data" with explore-ml-data, so
+    // explore would survive if the helper's text were used too; here the
+    // helper (build) is ignored and setup decides.
+    const config = configWithDefaults({ helperSkills: ["build-ml-pipeline"] });
+    const out = selectBodiesSupersededBy(["setup-ml-project", "build-ml-pipeline"], loaded, skills, new Set(), config);
+    expect(names(out)).toEqual(["explore-ml-data"]);
+    expect(out[0].reason).toContain("superseded by setup-ml-project");
+    expect(out[0].reason).not.toContain("build-ml-pipeline");
+  });
+
+  it("archives an older helper body when a non-helper skill is loaded", () => {
+    const loaded = [
+      { name: "explore-ml-data", seq: 1 },
+      { name: "setup-ml-project", seq: 2 },
+    ];
+    const config = configWithDefaults({ helperSkills: ["explore-ml-data"] });
+    expect(names(selectBodiesSupersededBy(["setup-ml-project"], loaded, skills, new Set(), config))).toEqual(["explore-ml-data"]);
   });
 
   it("returns nothing without a new skill", () => {

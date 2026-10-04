@@ -1,5 +1,18 @@
 {
   "entrySkill": "triage-ml-task",
+  "pinEntrySkill": true,
+  "helperSkills": [
+    "add-python-package",
+    "choose-python-library",
+    "export-ml-notebook",
+    "export-ml-site",
+    "persist-ml-git",
+    "plot-ml-figure",
+    "research-ml-practice",
+    "setup-git",
+    "setup-python-env",
+    "setup-workspace"
+  ],
   "blockDirectSkillReads": true,
   "threshold": 0.15,
   "minKeep": 2,

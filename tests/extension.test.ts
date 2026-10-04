@@ -57,6 +57,7 @@ const SPECS: SkillSpec[] = [
   { name: "explore-ml-data", description: "Explore and profile the data before modelling." },
   { name: "setup-ml-project", description: "Set up and bootstrap a new ML workspace." },
   { name: "build-ml-pipeline", description: "Build a skrub pipeline for the predictor." },
+  { name: "plot-ml-figure", description: "Pick how to draw a chart before custom plot code." },
   { name: "hidden-skill", description: "Only invoked by an explicit command.", disableModelInvocation: true },
 ];
 
@@ -167,7 +168,7 @@ function textOf(message: any): string {
 }
 
 function isPlaceholder(message: any): boolean {
-  return textOf(message).includes("Previously loaded skill body");
+  return textOf(message).includes("Skill body archived");
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -395,6 +396,70 @@ describe("eviction", () => {
     expect(out.some(isPlaceholder)).toBe(false);
   });
 
+  it("keeps the calling skill when a helper skill is loaded mid-run", async () => {
+    const h = await startSession({ helperSkills: ["plot-ml-figure"] });
+    await h.prompt("explore the data");
+    const explore = await h.loadSkill("explore-ml-data");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [explore] });
+    const plot = await h.loadSkill("plot-ml-figure");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [plot] });
+    const out = await h.context([explore, plot]);
+    expect(out.some(isPlaceholder)).toBe(false);
+  });
+
+  it("archives the helper and the caller when a non-helper skill is loaded next", async () => {
+    const h = await startSession({ helperSkills: ["plot-ml-figure"] });
+    await h.prompt("explore the data");
+    const explore = await h.loadSkill("explore-ml-data");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [explore] });
+    const plot = await h.loadSkill("plot-ml-figure");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [plot] });
+    const setup = await h.loadSkill("setup-ml-project");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [setup] });
+    const out = await h.context([explore, plot, setup]);
+    expect(out.map(isPlaceholder)).toEqual([true, true, false]);
+  });
+
+  it("without helperSkills, a helper load archives the calling skill", async () => {
+    const h = await startSession();
+    await h.prompt("explore the data");
+    const explore = await h.loadSkill("explore-ml-data");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [explore] });
+    const plot = await h.loadSkill("plot-ml-figure");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [plot] });
+    const out = await h.context([explore, plot]);
+    expect(isPlaceholder(out[0])).toBe(true);
+  });
+
+  it("pins the entry skill so the model does not have to reload it after each stage", async () => {
+    const h = await startSession({ entrySkill: "triage-ml-task", minKeep: 0 });
+    await h.prompt("what should I do");
+    const triage = await h.loadSkill("triage-ml-task");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [triage] });
+    const setup = await h.loadSkill("setup-ml-project");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [setup] });
+    await h.prompt("bootstrap and scaffold the new project workspace");
+    const out = await h.context([triage, setup]);
+    expect(out.some(isPlaceholder)).toBe(false);
+  });
+
+  it("can stop pinning the entry skill", async () => {
+    const h = await startSession({ entrySkill: "triage-ml-task", pinEntrySkill: false });
+    await h.prompt("what should I do");
+    const triage = await h.loadSkill("triage-ml-task");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [triage] });
+    const setup = await h.loadSkill("setup-ml-project");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [setup] });
+    const out = await h.context([triage, setup]);
+    expect(isPlaceholder(out[0])).toBe(true);
+  });
+
+  it("explains that the entry skill pin comes from the config", async () => {
+    const h = await startSession({ entrySkill: "triage-ml-task" });
+    await h.commands.get("skills-unpin").handler("triage-ml-task", h.ctx);
+    expect(h.notifications.at(-1)).toContain("pinEntrySkill");
+  });
+
   it("restores loaded bodies from the session branch on resume", async () => {
     const first = await startSession();
     await first.prompt("explore the data");
@@ -502,5 +567,14 @@ describe("config location", () => {
     const listing = h.notifications.at(-1)!;
     expect(listing).toContain(join(agentDir, "skill-lifecycle.json"));
     expect(listing).toContain(join(root, ".pi", "skill-lifecycle.json"));
+  });
+
+  it("marks helper skills in /skills-list", async () => {
+    const h = await startSession({ helperSkills: ["plot-ml-figure"] });
+    await h.prompt("hi");
+    await h.commands.get("skills-list").handler("", h.ctx);
+    const listing = h.notifications.at(-1)!;
+    expect(listing).toContain("plot-ml-figure 🧩");
+    expect(listing).not.toContain("explore-ml-data 🧩");
   });
 });

@@ -106,7 +106,7 @@ describe.skipIf(!process.env.PI_E2E)("pi end-to-end", () => {
 
     const last = requests[requests.length - 1];
     const [explore, setup] = skillResults(last);
-    expect(explore.text).toContain("Previously loaded skill body");
+    expect(explore.text).toContain("Skill body archived");
     expect(setup.text).toContain("Instructions.");
   });
 });
@@ -173,7 +173,66 @@ describe.skipIf(!process.env.PI_E2E)("pi end-to-end: mid-run skill switch", () =
     const last = requests[3];
     expect(last.messages.filter((m: any) => m.role === "user")).toHaveLength(1);
     const [explore, setup] = skillResults(last);
-    expect(explore.text).toContain("Previously loaded skill body");
+    expect(explore.text).toContain("Skill body archived");
     expect(setup.text).toContain("Instructions.");
+  });
+});
+
+/**
+ * Helper skills: explore-ml-data calls a helper (setup-ml-project is declared
+ * as a helper here). The helper load must not archive the calling skill.
+ */
+describe.skipIf(!process.env.PI_E2E)("pi end-to-end: helper skill", () => {
+  const HELPER_SCRIPT = [
+    { tool: "skill", args: { name: "explore-ml-data" } },
+    { tool: "skill", args: { name: "setup-ml-project" } },
+    { text: "used the helper" },
+  ];
+  let workspace: string;
+  let requests: any[];
+
+  beforeAll(() => {
+    workspace = mkdtempSync(join(tmpdir(), "skill-lifecycle-e2e-helper-"));
+    for (const [name, description] of Object.entries(SKILLS)) {
+      const dir = join(workspace, ".agents", "skills", name);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: ${description}\n---\n\n# ${name}\n\n${"Instructions. ".repeat(400)}\n`);
+    }
+    mkdirSync(join(workspace, ".pi"), { recursive: true });
+    writeFileSync(join(workspace, ".pi", "skill-lifecycle.json"), JSON.stringify({ helperSkills: ["setup-ml-project"] }));
+    execFileSync(
+      PI,
+      [
+        "-p", "--offline", "--approve", "--no-extensions",
+        "-e", join(ROOT, "extensions", "index.ts"),
+        "-e", join(ROOT, "tests", "e2e", "scripted-provider.ts"),
+        "--model", "scripted/m",
+        "--session-dir", join(workspace, "sessions"),
+        "I would like to explore the data",
+      ],
+      {
+        cwd: workspace,
+        env: {
+          ...process.env,
+          PI_CODING_AGENT_DIR: join(workspace, "agent"),
+          E2E_LOG: join(workspace, "requests.jsonl"),
+          E2E_SCRIPT: JSON.stringify(HELPER_SCRIPT),
+        },
+        stdio: "pipe",
+        timeout: 60_000,
+      },
+    );
+    requests = readFileSync(join(workspace, "requests.jsonl"), "utf-8").trim().split("\n").map((line) => JSON.parse(line));
+  }, 100_000);
+
+  afterAll(() => {
+    if (workspace) rmSync(workspace, { recursive: true, force: true });
+  });
+
+  it("keeps the calling skill's body after the helper is loaded", () => {
+    const last = requests.at(-1);
+    const [explore, helper] = last.messages.filter((m: any) => m.toolName === "skill");
+    expect(explore.text).toContain("Instructions.");
+    expect(helper.text).toContain("Instructions.");
   });
 });

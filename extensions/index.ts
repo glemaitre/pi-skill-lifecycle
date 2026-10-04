@@ -177,6 +177,7 @@ export default function (pi: ExtensionAPI) {
     configSources = [user && paths.user, project && paths.project].filter((p): p is string => !!p);
     config = configWithDefaults({ ...user, ...project });
     configPins = new Set(config.pinned.map((name) => name.toLowerCase()));
+    if (config.entrySkill && config.pinEntrySkill) configPins.add(config.entrySkill.toLowerCase());
   }
 
   /** Rebuild the loaded-body state from the active session branch (resume, fork, /tree). */
@@ -245,6 +246,8 @@ export default function (pi: ExtensionAPI) {
    * Mid-run eviction: when a turn loaded a skill (for example after an
    * ask_user_question answer redirected the work), archive the other bodies
    * that are unrelated to it before the next LLM request of the same run.
+   * Loading a helper skill (`helperSkills`) archives nothing, so the skill
+   * that called it keeps its instructions.
    * Done at turn end rather than in the tool, because tool calls of one
    * assistant message can run in parallel and load several skills together.
    */
@@ -389,7 +392,10 @@ export default function (pi: ExtensionAPI) {
       const name = args.trim().toLowerCase();
       if (!name) return ctx.ui.notify("Usage: /skills-unpin <skill-name>", "warning");
       if (configPins.has(name)) {
-        return ctx.ui.notify(`${name} is pinned in ${configSources.join(" or ")}; remove it there`, "warning");
+        const where = name === config.entrySkill.toLowerCase() && config.pinEntrySkill
+          ? "as the entry skill (set pinEntrySkill to false"
+          : `in ${configSources.join(" or ")} (remove it there`;
+        return ctx.ui.notify(`${name} is pinned ${where})`, "warning");
       }
       if (!userPins.delete(name)) return ctx.ui.notify(`Skill not pinned: ${name}`, "warning");
       ctx.ui.notify(`📍 Unpinned: ${name}`, "info");
@@ -400,15 +406,16 @@ export default function (pi: ExtensionAPI) {
     description: "Show known skills and their loaded/pinned status",
     handler: async (_args, ctx) => {
       const pins = pinned();
+      const helpers = new Set(config.helperSkills);
       const lines = [...skillsByName.values()].map((s) => {
-        const marks = `${pins.has(s.name) ? " 📌" : ""}${loaded.has(s.name) ? " 📖" : ""}${s.disableModelInvocation ? " (command only)" : ""}`;
+        const marks = `${pins.has(s.name) ? " 📌" : ""}${loaded.has(s.name) ? " 📖" : ""}${helpers.has(s.name) ? " 🧩" : ""}${s.disableModelInvocation ? " (command only)" : ""}`;
         return `  ${s.name}${marks}`;
       });
       ctx.ui.notify(
         [
           `Skills (${skillsByName.size}) — eviction ${enabled ? "on" : "off"}; loaded: ${[...loaded.keys()].join(", ") || "none"}`,
           ...(skillsByName.size === 0 ? ["  (list is filled on the first prompt)"] : lines),
-          "📌 pinned   📖 body loaded",
+          "📌 pinned   📖 body loaded   🧩 helper (does not archive other bodies)",
           `Config: ${configSources.join(" + ") || "defaults"}`,
         ].join("\n"),
         "info",
