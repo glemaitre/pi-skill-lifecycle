@@ -30,6 +30,7 @@ import {
   extractSkillNameFromContent,
   fingerprintPrompt,
   isMinorChange,
+  selectBodiesSupersededBy,
   selectBodiesToEvict,
 } from "./rules.ts";
 
@@ -229,12 +230,36 @@ export default function (pi: ExtensionAPI) {
       pinned(),
       config,
     );
-    for (const body of evicted) loaded.delete(body.name);
+    evict(evicted, ctx);
+  });
 
+  function evict(evicted: Array<{ name: string; score: number; reason: string }>, ctx: ExtensionContext) {
+    for (const body of evicted) loaded.delete(body.name);
     if (config.verbose && evicted.length > 0 && ctx.hasUI) {
       const lines = evicted.map((b) => `  ${b.name} (${(b.score * 100).toFixed(0)}%) — ${b.reason}`);
       ctx.ui.notify(`🧹 Archived skill bodies: ${evicted.map((b) => b.name).join(", ")}\n${lines.join("\n")}`, "info");
     }
+  }
+
+  /**
+   * Mid-run eviction: when a turn loaded a skill (for example after an
+   * ask_user_question answer redirected the work), archive the other bodies
+   * that are unrelated to it before the next LLM request of the same run.
+   * Done at turn end rather than in the tool, because tool calls of one
+   * assistant message can run in parallel and load several skills together.
+   */
+  pi.on("turn_end", (event, ctx) => {
+    if (!enabled || !config.evictOnSkillLoad) return;
+    const fresh = [...new Set((event.toolResults ?? []).map(skillResultName).filter((n): n is string => !!n))];
+    if (fresh.length === 0 || loaded.size <= fresh.length) return;
+    const evicted = selectBodiesSupersededBy(
+      fresh,
+      [...loaded].map(([name, n]) => ({ name, seq: n })),
+      new Map([...skillsByName].map(([name, s]) => [name, toPureSkill(s)])),
+      pinned(),
+      config,
+    );
+    evict(evicted, ctx);
   });
 
   /**

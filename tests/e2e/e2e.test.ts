@@ -110,3 +110,70 @@ describe.skipIf(!process.env.PI_E2E)("pi end-to-end", () => {
     expect(setup.text).toContain("Instructions.");
   });
 });
+
+/**
+ * Mid-run eviction: one user prompt, the model loads a skill, gets an answer
+ * from the user (a bash echo stands in for ask_user_question), then loads an
+ * unrelated skill. The first body is archived within the same run.
+ */
+describe.skipIf(!process.env.PI_E2E)("pi end-to-end: mid-run skill switch", () => {
+  const MID_RUN_SCRIPT = [
+    { tool: "skill", args: { name: "explore-ml-data" } },
+    { tool: "bash", args: { command: "echo 'answer: there is no project yet'" } },
+    { tool: "skill", args: { name: "setup-ml-project" } },
+    { text: "switched to setup" },
+  ];
+  let workspace: string;
+  let requests: any[];
+
+  beforeAll(() => {
+    workspace = mkdtempSync(join(tmpdir(), "skill-lifecycle-e2e-midrun-"));
+    for (const [name, description] of Object.entries(SKILLS)) {
+      const dir = join(workspace, ".agents", "skills", name);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: ${description}\n---\n\n# ${name}\n\n${"Instructions. ".repeat(400)}\n`);
+    }
+    execFileSync(
+      PI,
+      [
+        "-p", "--offline", "--approve", "--no-extensions",
+        "-e", join(ROOT, "extensions", "index.ts"),
+        "-e", join(ROOT, "tests", "e2e", "scripted-provider.ts"),
+        "--model", "scripted/m",
+        "--session-dir", join(workspace, "sessions"),
+        "I would like to explore the data",
+      ],
+      {
+        cwd: workspace,
+        env: {
+          ...process.env,
+          PI_CODING_AGENT_DIR: join(workspace, "agent"),
+          E2E_LOG: join(workspace, "requests.jsonl"),
+          E2E_SCRIPT: JSON.stringify(MID_RUN_SCRIPT),
+        },
+        stdio: "pipe",
+        timeout: 60_000,
+      },
+    );
+    requests = readFileSync(join(workspace, "requests.jsonl"), "utf-8").trim().split("\n").map((line) => JSON.parse(line));
+  }, 100_000);
+
+  afterAll(() => {
+    if (workspace) rmSync(workspace, { recursive: true, force: true });
+  });
+
+  const skillResults = (request: any) => request.messages.filter((m: any) => m.toolName === "skill");
+
+  it("keeps the first body while it is the only skill in use", () => {
+    // Request after the bash answer: explore is still the active skill.
+    expect(skillResults(requests[2])[0].text).toContain("Instructions.");
+  });
+
+  it("archives the first body as soon as an unrelated skill is loaded", () => {
+    const last = requests[3];
+    expect(last.messages.filter((m: any) => m.role === "user")).toHaveLength(1);
+    const [explore, setup] = skillResults(last);
+    expect(explore.text).toContain("Previously loaded skill body");
+    expect(setup.text).toContain("Instructions.");
+  });
+});

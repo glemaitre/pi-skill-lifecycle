@@ -57,6 +57,18 @@ Before each user prompt, loaded bodies are scored against it:
 - other bodies are evicted when their relevance score is below `threshold`;
 - with `maxKeep` > 0, the oldest unprotected bodies are evicted beyond that cap.
 
+When the model loads a skill in the middle of a run (for example after an
+`ask_user_question` answer redirects the work), the other loaded bodies are
+scored right away against the new skill's name and description, before the
+next request of the same run:
+
+- pinned bodies and the skills loaded in that turn are never evicted;
+- `minKeep` does not apply, so the new skill replaces unrelated older ones;
+- other bodies are evicted when their score is below `threshold`; `maxKeep`
+  applies as above.
+
+Set `evictOnSkillLoad` to `false` to only evict at user prompts.
+
 Short follow-ups and prompts on the same topic skip scoring. Scoring uses
 keyword rules from the config, then description and name overlap (stopwords
 ignored).
@@ -102,6 +114,7 @@ Example:
 |---|---|---|
 | `entrySkill` | `""` | Skill to load first for ambiguous requests; mentioned only if installed |
 | `blockDirectSkillReads` | `true` | Block `read` on a known SKILL.md and point to the `skill` tool |
+| `evictOnSkillLoad` | `true` | Evict unrelated bodies as soon as another skill is loaded mid-run |
 | `threshold` | `0.15` | Minimum relevance score (0..1) for an unprotected body to stay |
 | `minKeep` | `2` | The N most recently loaded bodies are never evicted |
 | `maxKeep` | `0` | Maximum number of loaded bodies (0 = unlimited) |

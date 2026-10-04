@@ -53,6 +53,12 @@ export interface EngineConfig {
   entrySkill?: string;
   /** Block `read` calls on a known SKILL.md and point to the skill tool. Default: true */
   blockDirectSkillReads?: boolean;
+  /**
+   * When the model loads a skill during a run, evict other loaded bodies that
+   * are unrelated to the newly loaded skill(s), without waiting for the next
+   * user prompt. Default: true
+   */
+  evictOnSkillLoad?: boolean;
 
   // ── Change-detection optimisation ────────────────────────────
   /** Skip scoring when the prompt is a short follow-up. Default: true */
@@ -89,6 +95,7 @@ export const DEFAULT_CONFIG: Required<EngineConfig> = {
   verbose: true,
   entrySkill: "",
   blockDirectSkillReads: true,
+  evictOnSkillLoad: true,
   skipOnShortPrompts: true,
   minScorablePromptLength: 15,
   topicChangeThreshold: 0.7,
@@ -105,6 +112,7 @@ export function configWithDefaults(partial?: EngineConfig): Required<EngineConfi
     pinned: partial?.pinned ?? [],
     entrySkill: partial?.entrySkill ?? DEFAULT_CONFIG.entrySkill,
     blockDirectSkillReads: partial?.blockDirectSkillReads ?? DEFAULT_CONFIG.blockDirectSkillReads,
+    evictOnSkillLoad: partial?.evictOnSkillLoad ?? DEFAULT_CONFIG.evictOnSkillLoad,
     skipOnShortPrompts: partial?.skipOnShortPrompts ?? DEFAULT_CONFIG.skipOnShortPrompts,
     minScorablePromptLength: partial?.minScorablePromptLength ?? DEFAULT_CONFIG.minScorablePromptLength,
     topicChangeThreshold: partial?.topicChangeThreshold ?? DEFAULT_CONFIG.topicChangeThreshold,
@@ -448,4 +456,37 @@ export function selectBodiesToEvict(
   }
 
   return evicted;
+}
+
+/**
+ * Decide which loaded bodies a skill load made obsolete, in the middle of a run.
+ *
+ * Loading a new skill means the work moved to that skill's domain, so other
+ * bodies are scored against the new skills' names and descriptions instead of
+ * the user prompt (which led to the older skills in the first place).
+ *
+ * - The newly loaded skills and pinned bodies are never evicted.
+ * - `minKeep` does not apply: the new skill is the one being worked on.
+ * - Other bodies are evicted when their score is below `threshold`;
+ *   `maxKeep` applies as in `selectBodiesToEvict`.
+ */
+export function selectBodiesSupersededBy(
+  newNames: ReadonlyArray<string>,
+  loaded: LoadedBody[],
+  skillsByName: ReadonlyMap<string, Skill>,
+  pinnedSet: ReadonlySet<string>,
+  config: Required<EngineConfig>,
+): Array<{ name: string; score: number; reason: string }> {
+  const fresh = new Set(newNames);
+  if (fresh.size === 0) return [];
+  const text = [...fresh]
+    .map((name) => `${name} ${skillsByName.get(name)?.description ?? ""}`)
+    .join("\n");
+  const protectedSet = new Set([...pinnedSet, ...fresh]);
+  return selectBodiesToEvict(text, loaded, skillsByName, protectedSet, { ...config, minKeep: 0 }).map((b) => ({
+    ...b,
+    reason: b.reason.startsWith("over maxKeep") || b.reason === "skill no longer installed"
+      ? b.reason
+      : `superseded by ${[...fresh].join(", ")} (${b.reason})`,
+  }));
 }

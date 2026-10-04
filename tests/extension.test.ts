@@ -347,6 +347,54 @@ describe("eviction", () => {
     expect(isPlaceholder(out[0])).toBe(false);
   });
 
+  it("archives an unrelated body when another skill is loaded later in the same run", async () => {
+    const h = await startSession();
+    await h.prompt("explore the data");
+    const explore = await h.loadSkill("explore-ml-data");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [explore] });
+    // ask_user_question answer redirects the work; no new user prompt.
+    const setup = await h.loadSkill("setup-ml-project");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [setup] });
+    const out = await h.context([explore, setup]);
+    expect(isPlaceholder(out[0])).toBe(true);
+    expect(isPlaceholder(out[1])).toBe(false);
+  });
+
+  it("keeps skills loaded together in one turn", async () => {
+    const h = await startSession();
+    await h.prompt("explore the data");
+    const explore = await h.loadSkill("explore-ml-data");
+    const setup = await h.loadSkill("setup-ml-project");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [explore, setup] });
+    const out = await h.context([explore, setup]);
+    expect(out.some(isPlaceholder)).toBe(false);
+  });
+
+  it("keeps pinned bodies and related bodies on mid-run loads", async () => {
+    const h = await startSession({
+      rules: [{ skillName: "explore-ml-data", keywords: ["workspace"] }],
+    });
+    await h.commands.get("skills-pin").handler("triage-ml-task", h.ctx);
+    await h.prompt("what should I do");
+    const triage = await h.loadSkill("triage-ml-task");
+    const explore = await h.loadSkill("explore-ml-data");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [triage, explore] });
+    const setup = await h.loadSkill("setup-ml-project");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [setup] });
+    const out = await h.context([triage, explore, setup]);
+    expect(out.some(isPlaceholder)).toBe(false);
+  });
+
+  it("can disable mid-run eviction in the config", async () => {
+    const h = await startSession({ evictOnSkillLoad: false });
+    await h.prompt("explore the data");
+    const explore = await h.loadSkill("explore-ml-data");
+    const setup = await h.loadSkill("setup-ml-project");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [setup] });
+    const out = await h.context([explore, setup]);
+    expect(out.some(isPlaceholder)).toBe(false);
+  });
+
   it("restores loaded bodies from the session branch on resume", async () => {
     const first = await startSession();
     await first.prompt("explore the data");

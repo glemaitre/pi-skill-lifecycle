@@ -17,6 +17,7 @@ import {
   fingerprintPrompt,
   extractSkillNameFromContent,
   buildPlaceholder,
+  selectBodiesSupersededBy,
   selectBodiesToEvict,
 } from "../extensions/rules.ts";
 import type { Skill, RelevanceRule } from "../extensions/rules.ts";
@@ -493,5 +494,57 @@ describe("selectBodiesToEvict", () => {
 
   it("returns nothing when nothing is loaded", () => {
     expect(selectBodiesToEvict("x", [], skills, new Set(), configWithDefaults())).toEqual([]);
+  });
+});
+
+// ── selectBodiesSupersededBy ──────────────────────────────────────
+
+describe("selectBodiesSupersededBy", () => {
+  const skills = new Map(
+    [
+      makeSkill({ name: "explore-ml-data", description: "Explore and profile the data" }),
+      makeSkill({ name: "setup-ml-project", description: "Set up and bootstrap a workspace" }),
+      makeSkill({ name: "build-ml-pipeline", description: "Build a skrub pipeline from the data" }),
+    ].map((s) => [s.name, s]),
+  );
+  const names = (out: Array<{ name: string }>) => out.map((e) => e.name).sort();
+
+  it("evicts bodies unrelated to the new skill, ignoring minKeep", () => {
+    const loaded = [
+      { name: "explore-ml-data", seq: 1 },
+      { name: "setup-ml-project", seq: 2 },
+    ];
+    const out = selectBodiesSupersededBy(["setup-ml-project"], loaded, skills, new Set(), configWithDefaults({ minKeep: 5 }));
+    expect(names(out)).toEqual(["explore-ml-data"]);
+    expect(out[0].reason).toContain("superseded by setup-ml-project");
+  });
+
+  it("keeps bodies related to the new skill's description", () => {
+    const loaded = [
+      { name: "explore-ml-data", seq: 1 },
+      { name: "build-ml-pipeline", seq: 2 },
+    ];
+    // "data" appears in both descriptions.
+    expect(selectBodiesSupersededBy(["build-ml-pipeline"], loaded, skills, new Set(), configWithDefaults())).toEqual([]);
+  });
+
+  it("never evicts the new skills or pinned bodies", () => {
+    const loaded = [
+      { name: "explore-ml-data", seq: 1 },
+      { name: "setup-ml-project", seq: 2 },
+      { name: "build-ml-pipeline", seq: 3 },
+    ];
+    const out = selectBodiesSupersededBy(
+      ["setup-ml-project", "build-ml-pipeline"],
+      loaded,
+      skills,
+      new Set(["explore-ml-data"]),
+      configWithDefaults(),
+    );
+    expect(out).toEqual([]);
+  });
+
+  it("returns nothing without a new skill", () => {
+    expect(selectBodiesSupersededBy([], [{ name: "explore-ml-data", seq: 1 }], skills, new Set(), configWithDefaults())).toEqual([]);
   });
 });
