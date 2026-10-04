@@ -1,4 +1,4 @@
-# Pi Skill Lifecycle
+# @probabl/pi-skill-lifecycle
 
 OpenCode-style skill loading for Pi: a `skill` tool, a binding skill protocol in
 the prompt, and archiving of skill bodies that are no longer relevant. It needs
@@ -161,8 +161,8 @@ search; they were tuned on one skill pack.
 ## Install
 
 ```bash
+pi install npm:@probabl/pi-skill-lifecycle
 pi install ./pi-skill-lifecycle          # local checkout
-pi install git:github.com/glemaitre/pi-skill-lifecycle
 pi --extension ./pi-skill-lifecycle/extensions/index.ts   # try once
 ```
 

@@ -1,5 +1,5 @@
 {
-  "name": "pi-skill-lifecycle",
+  "name": "@probabl/pi-skill-lifecycle",
   "version": "0.2.0",
   "description": "OpenCode-style skill loading for Pi: a skill tool, a binding protocol, and archiving of skill bodies that are no longer relevant, with no configuration.",
   "keywords": [
@@ -8,7 +8,23 @@
     "skill-management"
   ],
   "license": "MIT",
-  "author": "",
+  "author": "Probabl",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/probabl-ai/pi-skill-lifecycle.git"
+  },
+  "homepage": "https://github.com/probabl-ai/pi-skill-lifecycle#readme",
+  "bugs": {
+    "url": "https://github.com/probabl-ai/pi-skill-lifecycle/issues"
+  },
+  "files": [
+    "extensions/",
+    "README.md",
+    "LICENSE"
+  ],
   "type": "module",
   "pi": {
     "extensions": [
