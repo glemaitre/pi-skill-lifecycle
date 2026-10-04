@@ -1,7 +1,7 @@
 {
   "name": "pi-skill-lifecycle",
-  "version": "0.1.0",
-  "description": "Dynamically load and unload Pi skills based on conversation relevance \u2014 saves context, reduces noise.",
+  "version": "0.2.0",
+  "description": "OpenCode-style skill loading for Pi: a skill tool, a binding protocol, and archiving of skill bodies that are no longer relevant, with no configuration.",
   "keywords": [
     "pi-package",
     "skill-lifecycle",
@@ -27,6 +27,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:e2e": "PI_E2E=1 vitest run tests/e2e",
-    "typecheck": "tsc --noEmit -p ."
+    "typecheck": "tsc --noEmit -p .",
+    "replay": "node scripts/replay.ts"
   }
 }

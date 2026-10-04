@@ -1,8 +1,16 @@
 /**
- * Relevance engine for smart skill lifecycle management.
+ * Configuration and eviction decisions.
+ *
+ * Relevance comes from the skill index (relevance.ts), built from the
+ * installed skills. Keyword rules, helper lists, and the entry skill can still
+ * be set in the config; they override or add to what the index derives.
  *
  * Pure logic — no Pi imports, fully testable in isolation.
  */
+
+import { decideRelevance, tokenize, type RelevanceOptions, type SkillIndex } from "./relevance.ts";
+
+export { tokenize } from "./relevance.ts";
 
 // ── Types ─────────────────────────────────────────────────────────
 
@@ -18,382 +26,197 @@ export interface Skill {
 }
 
 /**
- * A single rule that maps a skill to trigger keywords.
+ * Optional keyword rule: when enough of its keywords appear in the prompt,
+ * the skill's body is kept whatever the index says.
  */
 export interface RelevanceRule {
-  /** Skill name this rule applies to (lowercase) */
+  /** Skill name this rule applies to */
   skillName: string;
-  /** Keywords that suggest this skill is relevant (lowercase) */
+  /** Keywords (substrings of the prompt, case-insensitive) */
   keywords: string[];
-  /** Optional weight multiplier (default 1.0) */
+  /** Multiplier of the matched-keyword fraction (default 1.0) */
   weight?: number;
 }
 
-/**
- * Configuration for the relevance engine, loadable from a JSON file.
- */
+/** Configuration, loadable from skill-lifecycle.json. Every key is optional. */
 export interface EngineConfig {
-  /** Minimum score (0..1) a skill needs to be kept. Default: 0.15 */
-  threshold?: number;
-  /** The N most recently loaded skill bodies are never evicted. Default: 2 */
-  minKeep?: number;
-  /** Maximum number of loaded skill bodies. 0 = unlimited. Default: 0 */
-  maxKeep?: number;
-  /** Custom relevance rules */
-  rules?: RelevanceRule[];
-  /** Skills to always keep (pinned by config) */
-  pinned?: string[];
-  /** Whether to log notifications on skill changes. Default: true */
-  verbose?: boolean;
+  // ── Relevance (derived from the installed skills) ────────────
+  /** A loaded body stays when its skill ranks in the top N of all installed skills for the prompt. Default: 3 */
+  topK?: number;
+  /** …or scores at least this fraction of the best-scoring skill. Default: 0.5 */
+  relativeScore?: number;
+  /** Best score below this means the prompt carries no topic signal: nothing is evicted. Default: 2 */
+  minSignal?: number;
   /**
-   * Skill the model should load first for ambiguous requests (for example
-   * `triage-ml-task`). Only mentioned in the prompt when it is installed.
-   * Default: "" (none).
+   * When a skill is loaded mid-run, keep loaded bodies whose skill mentions
+   * it by name (the caller of a sub-step). Default: false
+   */
+  protectCallers?: boolean;
+  /** Infer the entry skill from the skills when neither the config nor a frontmatter declares one. Default: true */
+  inferEntrySkill?: boolean;
+
+  // ── Overrides ────────────────────────────────────────────────
+  /** Keyword rules that keep a body when they match (see RelevanceRule). Default: [] */
+  rules?: RelevanceRule[];
+  /** Minimum rule score (0..1) for a rule to keep a body. Default: 0.15 */
+  threshold?: number;
+  /**
+   * Skill the model should load first for ambiguous requests. Overrides a
+   * frontmatter `metadata.role: entry` and the inferred one. Default: ""
    */
   entrySkill?: string;
-  /**
-   * Never archive the entry skill's body. The protocol sends the model back
-   * to the entry skill after every stage, so archiving it only forces
-   * reloads. Only applies when `entrySkill` is set. Default: true
-   */
+  /** Never archive the entry skill's body. Default: true */
   pinEntrySkill?: boolean;
-  /** Block `read` calls on a known SKILL.md and point to the skill tool. Default: true */
-  blockDirectSkillReads?: boolean;
   /**
-   * When the model loads a skill during a run, evict other loaded bodies that
-   * are unrelated to the newly loaded skill(s), without waiting for the next
-   * user prompt. Default: true
-   */
-  evictOnSkillLoad?: boolean;
-  /**
-   * Skills that a workflow calls for a sub-step (for example
-   * `choose-python-library` or `persist-ml-git`). Loading one of them in the
-   * middle of a run never archives other bodies, so the calling skill keeps
-   * its instructions. Helper bodies are archived like any other body when a
-   * non-helper skill is loaded later, or at user prompts. Default: [] (none).
+   * Skills called for a sub-step: loading one mid-run archives nothing.
+   * Added to skills declaring `metadata.role: helper`. Default: []
    */
   helperSkills?: string[];
+  /** Skills whose bodies are never archived. Default: [] */
+  pinned?: string[];
 
-  // ── Change-detection optimisation ────────────────────────────
+  // ── Lifecycle ────────────────────────────────────────────────
+  /** The N most recently loaded bodies are never evicted at a user prompt. Default: 2 */
+  minKeep?: number;
+  /** Maximum number of loaded bodies; 0 = unlimited. Default: 0 */
+  maxKeep?: number;
+  /** Archive unrelated bodies as soon as another skill is loaded mid-run. Default: true */
+  evictOnSkillLoad?: boolean;
+  /** Block `read` calls on a known SKILL.md and point to the skill tool. Default: true */
+  blockDirectSkillReads?: boolean;
+  /** Notify when bodies are loaded or archived. Default: true */
+  verbose?: boolean;
+
+  // ── Change detection ─────────────────────────────────────────
   /** Skip scoring when the prompt is a short follow-up. Default: true */
   skipOnShortPrompts?: boolean;
-  /**
-   * Prompts shorter than this many characters skip scoring.
-   * Only used when skipOnShortPrompts is true. Default: 15.
-   */
+  /** Prompts shorter than this many characters skip scoring. Default: 15 */
   minScorablePromptLength?: number;
-  /**
-   * Token overlap ratio above which a prompt is considered the same topic.
-   * Range 0..1. Default: 0.7.
-   */
+  /** Token overlap ratio (0..1) above which a prompt counts as the same topic. Default: 0.7 */
   topicChangeThreshold?: number;
 }
 
-/**
- * A skill with its computed relevance score.
- */
-export interface ScoredSkill {
-  skill: Skill;
-  score: number;
-  reason: string;
-}
-
-// ── Defaults ─────────────────────────────────────────────────────-
+// ── Defaults ──────────────────────────────────────────────────────
 
 export const DEFAULT_CONFIG: Required<EngineConfig> = {
-  threshold: 0.15,
-  minKeep: 2,
-  maxKeep: 0,
+  topK: 3,
+  relativeScore: 0.5,
+  minSignal: 2,
+  protectCallers: false,
+  inferEntrySkill: true,
   rules: [],
-  pinned: [],
-  verbose: true,
+  threshold: 0.15,
   entrySkill: "",
   pinEntrySkill: true,
-  blockDirectSkillReads: true,
-  evictOnSkillLoad: true,
   helperSkills: [],
+  pinned: [],
+  minKeep: 2,
+  maxKeep: 0,
+  evictOnSkillLoad: true,
+  blockDirectSkillReads: true,
+  verbose: true,
   skipOnShortPrompts: true,
   minScorablePromptLength: 15,
   topicChangeThreshold: 0.7,
 };
 
-/**
- * Fill in defaults for a partial config.
- */
+/** Fill in defaults for a partial config; `undefined` and `null` values fall back to the default. */
 export function configWithDefaults(partial?: EngineConfig): Required<EngineConfig> {
-  return {
-    ...DEFAULT_CONFIG,
-    ...partial,
-    rules: partial?.rules ?? [],
-    pinned: partial?.pinned ?? [],
-    helperSkills: partial?.helperSkills ?? [],
-    entrySkill: partial?.entrySkill ?? DEFAULT_CONFIG.entrySkill,
-    pinEntrySkill: partial?.pinEntrySkill ?? DEFAULT_CONFIG.pinEntrySkill,
-    blockDirectSkillReads: partial?.blockDirectSkillReads ?? DEFAULT_CONFIG.blockDirectSkillReads,
-    evictOnSkillLoad: partial?.evictOnSkillLoad ?? DEFAULT_CONFIG.evictOnSkillLoad,
-    skipOnShortPrompts: partial?.skipOnShortPrompts ?? DEFAULT_CONFIG.skipOnShortPrompts,
-    minScorablePromptLength: partial?.minScorablePromptLength ?? DEFAULT_CONFIG.minScorablePromptLength,
-    topicChangeThreshold: partial?.topicChangeThreshold ?? DEFAULT_CONFIG.topicChangeThreshold,
-  };
+  const out: Record<string, unknown> = { ...DEFAULT_CONFIG };
+  for (const [key, value] of Object.entries(partial ?? {})) {
+    if (value !== undefined && value !== null && key in DEFAULT_CONFIG) out[key] = value;
+  }
+  return out as Required<EngineConfig>;
 }
 
-// ── Relevance scoring ─────────────────────────────────────────────
-
-/**
- * Tokenize a string into a set of lowercase word stems (3+ chars).
- */
-/**
- * Common English words that carry no topic. Without this list, "and"/"the"
- * overlap between any prompt and any description keeps unrelated skills alive.
- */
-const STOPWORDS = new Set([
-  "about", "after", "all", "also", "and", "any", "are", "before", "but", "can", "could",
-  "does", "each", "for", "from", "has", "have", "how", "into", "its", "just", "may",
-  "more", "most", "not", "now", "only", "other", "our", "out", "should", "some", "such",
-  "than", "that", "the", "their", "them", "then", "there", "these", "they", "this",
-  "use", "used", "using", "was", "were", "what", "when", "where", "which", "who", "why",
-  "will", "with", "would", "you", "your",
-]);
-
-export function tokenize(text: string): Set<string> {
-  // Split on anything that's not a letter or digit — hyphens and underscores are
-  // separators too so skill names like "build-ml-pipeline" break into individual tokens.
-  const words = text
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((w) => w.length >= 3 && !STOPWORDS.has(w));
-  return new Set(words);
+export function relevanceOptions(config: Required<EngineConfig>): RelevanceOptions {
+  return { topK: config.topK, relativeScore: config.relativeScore, minSignal: config.minSignal };
 }
 
-/**
- * Score a single skill against a user prompt using keyword rules and
- * the skill's own description as a fallback.
- *
- * Returns a number between 0 and 1.
- */
-export function scoreRelevance(
-  prompt: string,
-  skill: Skill,
-  rules: RelevanceRule[],
-): { score: number; reason: string } {
-  const lowerPrompt = prompt.toLowerCase();
-  const promptTokens = tokenize(prompt);
-
-  // 1. Check explicit rules for this skill
-  const skillRules = rules.filter((r) => r.skillName === skill.name);
-  let bestRuleScore = 0;
-  let bestRuleReason = "";
-
-  for (const rule of skillRules) {
-    const matchCount = rule.keywords.filter((kw) => lowerPrompt.includes(kw.toLowerCase())).length;
-    if (matchCount > 0) {
-      const raw = matchCount / rule.keywords.length;
-      const weighted = raw * (rule.weight ?? 1.0);
-      if (weighted > bestRuleScore) {
-        bestRuleScore = Math.min(1.0, weighted);
-        bestRuleReason = `rule matched ${matchCount}/${rule.keywords.length} keywords`;
-      }
-    }
-  }
-
-  // 2. Fallback: description-based scoring
-  const descTokens = tokenize(skill.description);
-  let descMatchCount = 0;
-  for (const token of descTokens) {
-    if (promptTokens.has(token)) descMatchCount++;
-  }
-  const descScore = descTokens.size > 0
-    ? descMatchCount / descTokens.size
-    : 0;
-
-  // The skill's name tokens are also a strong signal
-  const nameTokens = skill.name.toLowerCase().split(/[^a-z0-9]+/);
-  const nameInPrompt = nameTokens.find((t) => t.length >= 3 && lowerPrompt.includes(t)) ? 0.5 : 0;
-
-  // 3. Combine: rule score takes priority, desc is fallback
-  const combined = Math.max(bestRuleScore, descScore * 0.6, nameInPrompt);
-  const reason = bestRuleScore > 0
-    ? bestRuleReason
-    : descScore > 0
-      ? `description matched ${descMatchCount}/${descTokens.size} tokens`
-      : nameInPrompt > 0
-        ? "skill name found in prompt"
-        : "no match";
-
-  return { score: Math.min(1.0, combined), reason };
-}
-
-// ── Skill selection ───────────────────────────────────────────────
-
-/**
- * Filter and rank skills based on relevance to the user prompt.
- *
- * Rules:
- * - Pinned skills are always kept (score = 1.0).
- * - Zero-score skills are dropped unless we need them to reach minKeep.
- * - Skills are sorted by score descending.
- * - If maxKeep > 0, only the top N are kept.
- */
-export function selectRelevantSkills(
-  prompt: string,
-  skills: Skill[],
-  pinnedSet: Set<string>,
-  config: Required<EngineConfig>,
-): { kept: Skill[]; dropped: Array<{ skill: Skill; score: number; reason: string }> } {
-  if (skills.length === 0) {
-    return { kept: [], dropped: [] };
-  }
-
-  if (skills.length <= config.minKeep) {
-    // Not enough skills to bother filtering — keep all
-    return { kept: [...skills], dropped: [] };
-  }
-
-  // Score every skill
-  const scored: ScoredSkill[] = skills.map((skill) => {
-    const isPinned = pinnedSet.has(skill.name);
-    if (isPinned) {
-      return { skill, score: 1.0, reason: "pinned" };
-    }
-    const { score, reason } = scoreRelevance(prompt, skill, config.rules);
-    return { skill, score, reason };
-  });
-
-  // Split into kept and dropped
-  const aboveThreshold = scored.filter((s) => s.score >= config.threshold);
-  const belowThreshold = scored.filter((s) => s.score < config.threshold);
-
-  // Sort both by score descending
-  aboveThreshold.sort((a, b) => b.score - a.score);
-  belowThreshold.sort((a, b) => b.score - a.score);
-
-  // Ensure we keep at least minKeep
-  const kept: ScoredSkill[] = [...aboveThreshold];
-
-  if (kept.length < config.minKeep) {
-    const needed = config.minKeep - kept.length;
-    for (let i = 0; i < needed && i < belowThreshold.length; i++) {
-      kept.push(belowThreshold[i]);
-    }
-  }
-
-  // Apply maxKeep cap
-  if (config.maxKeep > 0 && kept.length > config.maxKeep) {
-    kept.sort((a, b) => b.score - a.score);
-    const dropped = kept.splice(config.maxKeep);
-    return {
-      kept: kept.map((s) => s.skill),
-      dropped: dropped.map((s) => ({ skill: s.skill, score: s.score, reason: s.reason })),
-    };
-  }
-
-  // Everything not kept is "dropped"
-  const keptNames = new Set(kept.map((s) => s.skill.name));
-  const dropped = scored
-    .filter((s) => !keptNames.has(s.skill.name))
-    .map((s) => ({ skill: s.skill, score: s.score, reason: s.reason }));
-
-  return {
-    kept: kept.map((s) => s.skill),
-    dropped,
-  };
-}
-
-// ── Config file loading ───────────────────────────────────────────
-
-/**
- * Config file name, looked up in the user agent directory and the project
- * `.pi` directory (see `configPaths` in index.ts).
- */
+/** Config file name, looked up in the user agent directory and the project `.pi` directory. */
 export const CONFIG_FILENAME = "skill-lifecycle.json";
 
-// ── Change detection ────────────────────────────────────────────
+// ── Roles ─────────────────────────────────────────────────────────
+
+export type RoleSource = "config" | "frontmatter" | "inferred";
+
+export interface Roles {
+  entry?: { name: string; source: RoleSource };
+  helpers: Map<string, RoleSource>;
+}
 
 /**
- * Token set of a previous prompt, used to decide whether the topic shifted.
+ * Entry and helper skills, from the config first, then the frontmatter, then
+ * (entry only) inference. Only installed skills are returned; before the
+ * skills are known (empty index, no prompt yet), configured names are kept.
  */
+export function resolveRoles(index: SkillIndex, config: Required<EngineConfig>): Roles {
+  const known = new Set(index.names);
+  const installed = { has: (name: string) => known.size === 0 || known.has(name) };
+  let entry: Roles["entry"];
+  if (config.entrySkill) {
+    if (installed.has(config.entrySkill)) entry = { name: config.entrySkill, source: "config" };
+  } else if (index.entry && (index.entry.source === "frontmatter" || config.inferEntrySkill)) {
+    entry = { name: index.entry.name, source: index.entry.source };
+  }
+  const helpers = new Map<string, RoleSource>();
+  for (const [name, role] of index.declaredRoles) if (role === "helper") helpers.set(name, "frontmatter");
+  for (const name of config.helperSkills) if (installed.has(name)) helpers.set(name, "config");
+  if (entry) helpers.delete(entry.name);
+  return { entry, helpers };
+}
+
+// ── Keyword rules ─────────────────────────────────────────────────
+
+/** Best rule score (0..1) of a skill for a prompt, or 0 without a matching rule. */
+export function ruleScore(prompt: string, skillName: string, rules: readonly RelevanceRule[]): { score: number; reason: string } {
+  const lower = prompt.toLowerCase();
+  let best = { score: 0, reason: "" };
+  for (const rule of rules) {
+    if (rule.skillName !== skillName || rule.keywords.length === 0) continue;
+    const matched = rule.keywords.filter((kw) => lower.includes(kw.toLowerCase())).length;
+    const score = Math.min(1, (matched / rule.keywords.length) * (rule.weight ?? 1));
+    if (score > best.score) best = { score, reason: `rule matched ${matched}/${rule.keywords.length} keywords` };
+  }
+  return best;
+}
+
+// ── Change detection ──────────────────────────────────────────────
+
+/** Token set of a previous prompt, used to decide whether the topic shifted. */
 export type PromptFingerprint = Set<string>;
 
-/**
- * Build a fingerprint from a prompt for change-detection comparisons.
- */
 export function fingerprintPrompt(prompt: string): PromptFingerprint {
   return tokenize(prompt);
 }
 
 /**
- * Determine whether a new prompt represents the same task as the previous one.
- *
- * Returns true when the prompt should **skip** re-scoring because:
- * - It is a very short follow-up ("yes", "continue", "run it")
- * - It has high token overlap with the previous prompt (> topicChangeThreshold)
- *
- * Returns false when a full re-score is warranted.
+ * Whether a new prompt continues the previous task, so scoring is skipped:
+ * a very short follow-up ("yes", "continue") or a prompt whose words mostly
+ * appeared in the previous one.
  */
 export function isMinorChange(
   currentPrompt: string,
   previousFingerprint: PromptFingerprint | undefined,
   config: Required<EngineConfig>,
 ): boolean {
-  if (previousFingerprint === undefined || previousFingerprint.size === 0) {
-    return false; // first turn or empty previous state → always score
-  }
-
+  if (previousFingerprint === undefined || previousFingerprint.size === 0) return false;
   const trimmed = currentPrompt.trim();
-
-  // Very short prompts are almost always acknowledgements or brief follow-ups
-  if (config.skipOnShortPrompts && trimmed.length < config.minScorablePromptLength) {
-    return true;
-  }
-
-  // Token overlap ratio: if most of the current tokens appeared in the previous prompt,
-  // the topic hasn't changed.
-  const currentTokens = tokenize(trimmed);
-  if (currentTokens.size === 0) return true; // no meaningful tokens → minor
-
-  let overlapCount = 0;
-  for (const token of currentTokens) {
-    if (previousFingerprint.has(token)) overlapCount++;
-  }
-  const overlapRatio = overlapCount / currentTokens.size;
-
-  return overlapRatio >= config.topicChangeThreshold;
-}
-
-/**
- * Build a summary string for notifications.
- */
-export function buildChangeSummary(
-  kept: Skill[],
-  dropped: Array<{ skill: Skill; score: number; reason: string }>,
-  totalBefore: number,
-): string {
-  if (dropped.length === 0) return "";
-
-  const keptNames = kept.map((s) => s.name).join(", ");
-  const droppedNames = dropped.map((s) => `${s.skill.name} (${(s.score * 100).toFixed(0)}%)`).join(", ");
-
-  return [
-    `🧠 Skills: ${kept.length}/${totalBefore} loaded after filtering`,
-    `   Kept: ${keptNames}`,
-    `   Dropped: ${droppedNames}`,
-  ].join("\n");
+  if (config.skipOnShortPrompts && trimmed.length < config.minScorablePromptLength) return true;
+  const current = tokenize(trimmed);
+  if (current.size === 0) return true;
+  let overlap = 0;
+  for (const token of current) if (previousFingerprint.has(token)) overlap++;
+  return overlap / current.size >= config.topicChangeThreshold;
 }
 
 // ── Skill body helpers ────────────────────────────────────────────
 
-/**
- * Regex to extract a skill name from its `<skill_content>` wrapper.
- */
+/** Regex to extract a skill name from its `<skill_content>` wrapper. */
 export const SKILL_CONTENT_RE = /<skill_content name="([^"]+)">/;
 
-/**
- * Scan a tool result's content blocks for a `<skill_content>` wrapper
- * and return the skill name, or null if this isn't skill body content.
- */
-export function extractSkillNameFromContent(
-  content: Array<{ type: string; text?: string }>,
-): string | null {
+/** Skill name of a `<skill_content>` tool result, or null if this isn't skill body content. */
+export function extractSkillNameFromContent(content: Array<{ type: string; text?: string }>): string | null {
   for (const block of content) {
     if (block.type === "text" && block.text) {
       const match = block.text.match(SKILL_CONTENT_RE);
@@ -403,9 +226,7 @@ export function extractSkillNameFromContent(
   return null;
 }
 
-/**
- * Build the placeholder text that replaces an evicted skill body.
- */
+/** Placeholder that replaces an evicted skill body. */
 export function buildPlaceholder(skillName: string): string {
   return [
     `<skill_content name="${skillName}">`,
@@ -414,99 +235,118 @@ export function buildPlaceholder(skillName: string): string {
     `</skill_content>`,
   ].join("\n");
 }
+
 // ── Body eviction ─────────────────────────────────────────────────
 
-/**
- * A skill body currently loaded in the conversation. `seq` grows with every
- * load, so a larger value means a more recent load.
- */
+/** A loaded skill body; a larger `seq` means a more recent load. */
 export interface LoadedBody {
   name: string;
   seq: number;
 }
 
-/**
- * Decide which loaded skill bodies to evict for the next user prompt.
- *
- * - Pinned bodies are never evicted.
- * - The `minKeep` most recently loaded bodies are never evicted, so the skill
- *   being worked on survives replies that share no keywords with it.
- * - Other bodies are evicted when their relevance score is below `threshold`.
- * - If `maxKeep` > 0, the oldest unprotected survivors are evicted until at
- *   most `maxKeep` bodies remain (pinned and recent bodies count but stay).
- */
-export function selectBodiesToEvict(
-  prompt: string,
-  loaded: LoadedBody[],
-  skillsByName: ReadonlyMap<string, Skill>,
-  pinnedSet: ReadonlySet<string>,
-  config: Required<EngineConfig>,
-): Array<{ name: string; score: number; reason: string }> {
-  const byRecency = [...loaded].sort((a, b) => b.seq - a.seq);
-  const recent = new Set(byRecency.slice(0, Math.max(0, config.minKeep)).map((b) => b.name));
-  const isProtected = (name: string) => pinnedSet.has(name) || recent.has(name);
+export interface Eviction {
+  name: string;
+  reason: string;
+}
 
-  const evicted: Array<{ name: string; score: number; reason: string }> = [];
+/**
+ * Evict bodies that are unprotected and not relevant to `text`, then apply
+ * `maxKeep`. Relevance is decided against all installed skills; a matching
+ * keyword rule keeps a body too. When the text carries no topic signal,
+ * nothing is evicted for relevance.
+ */
+function evictUnrelated(
+  text: string,
+  loaded: readonly LoadedBody[],
+  index: SkillIndex,
+  isProtected: (name: string) => boolean,
+  config: Required<EngineConfig>,
+  options: RelevanceOptions,
+  exclude: ReadonlySet<string> = new Set(),
+): Eviction[] {
+  const byRecency = [...loaded].sort((a, b) => b.seq - a.seq);
+  const decision = decideRelevance(index, text, options, exclude);
+  const installed = new Set(index.names);
+  const evicted: Eviction[] = [];
   const survivors: LoadedBody[] = [];
 
   for (const body of byRecency) {
     if (isProtected(body.name)) {
       survivors.push(body);
-      continue;
+    } else if (!installed.has(body.name)) {
+      evicted.push({ name: body.name, reason: "skill no longer installed" });
+    } else if (ruleScore(text, body.name, config.rules).score >= config.threshold || decision.relevant(body.name)) {
+      survivors.push(body);
+    } else {
+      evicted.push({ name: body.name, reason: decision.explain(body.name) });
     }
-    const skill = skillsByName.get(body.name);
-    if (!skill) {
-      evicted.push({ name: body.name, score: 0, reason: "skill no longer installed" });
-      continue;
-    }
-    const { score, reason } = scoreRelevance(prompt, skill, config.rules);
-    if (score < config.threshold) evicted.push({ name: body.name, score, reason });
-    else survivors.push(body);
   }
 
   if (config.maxKeep > 0) {
-    // survivors are ordered most recent first; drop from the oldest end.
+    // Survivors are ordered most recent first; drop from the oldest end.
     for (let i = survivors.length - 1; i >= 0 && survivors.length > config.maxKeep; i--) {
       if (isProtected(survivors[i].name)) continue;
       const [body] = survivors.splice(i, 1);
-      evicted.push({ name: body.name, score: 0, reason: `over maxKeep (${config.maxKeep})` });
+      evicted.push({ name: body.name, reason: `over maxKeep (${config.maxKeep})` });
     }
   }
-
   return evicted;
 }
 
 /**
- * Decide which loaded bodies a skill load made obsolete, in the middle of a run.
+ * Bodies to evict for the next user prompt.
  *
- * Loading a new skill means the work moved to that skill's domain, so other
- * bodies are scored against the new skills' names and descriptions instead of
- * the user prompt (which led to the older skills in the first place).
- *
- * - Helper skills (`helperSkills`) do not move the work: when every new
- *   skill is a helper, nothing is evicted, so the calling skill keeps its
- *   instructions. Otherwise only the non-helper skills are scored against.
- * - The newly loaded skills and pinned bodies are never evicted.
- * - `minKeep` does not apply: the new skill is the one being worked on.
- * - Other bodies are evicted when their score is below `threshold`;
- *   `maxKeep` applies as in `selectBodiesToEvict`.
+ * - Pinned bodies and the `minKeep` most recently loaded bodies are kept, so
+ *   the skill being worked on survives replies such as "use pixi".
+ * - Other bodies are evicted when their skill is not relevant to the prompt.
+ * - `maxKeep` > 0 evicts the oldest unprotected survivors beyond the cap.
  */
-export function selectBodiesSupersededBy(
-  newNames: ReadonlyArray<string>,
-  loaded: LoadedBody[],
-  skillsByName: ReadonlyMap<string, Skill>,
+export function selectBodiesToEvict(
+  prompt: string,
+  loaded: readonly LoadedBody[],
+  index: SkillIndex,
   pinnedSet: ReadonlySet<string>,
   config: Required<EngineConfig>,
-): Array<{ name: string; score: number; reason: string }> {
+): Eviction[] {
+  const byRecency = [...loaded].sort((a, b) => b.seq - a.seq);
+  const recent = new Set(byRecency.slice(0, Math.max(0, config.minKeep)).map((b) => b.name));
+  const isProtected = (name: string) => pinnedSet.has(name) || recent.has(name);
+  return evictUnrelated(prompt, loaded, index, isProtected, config, relevanceOptions(config));
+}
+
+/**
+ * Bodies made obsolete by skills loaded in the middle of a run.
+ *
+ * Loading a skill means the work moved to that skill's domain, so the other
+ * bodies are judged against the new skills' names and descriptions.
+ *
+ * - Loading only helpers (`roles.helpers`) evicts nothing: the calling skill
+ *   keeps its instructions. Otherwise only non-helpers are judged against.
+ * - The new skills and pinned bodies are kept; with `protectCallers`, so are
+ *   bodies whose skill mentions a new skill by name.
+ * - `minKeep` does not apply: the new skill is the one being worked on.
+ * - There is no abstaining: when no other skill shares terms with the new
+ *   one, every unprotected body is unrelated.
+ */
+export function selectBodiesSupersededBy(
+  newNames: readonly string[],
+  loaded: readonly LoadedBody[],
+  index: SkillIndex,
+  pinnedSet: ReadonlySet<string>,
+  helpers: ReadonlySet<string>,
+  config: Required<EngineConfig>,
+  descriptions: ReadonlyMap<string, string>,
+): Eviction[] {
   const fresh = new Set(newNames);
-  const helpers = new Set(config.helperSkills);
   const owners = [...fresh].filter((name) => !helpers.has(name));
   if (owners.length === 0) return [];
-  const text = owners
-    .map((name) => `${name} ${skillsByName.get(name)?.description ?? ""}`)
-    .join("\n");
-  const protectedSet = new Set([...pinnedSet, ...fresh]);
-  return selectBodiesToEvict(text, loaded, skillsByName, protectedSet, { ...config, minKeep: 0 }).map((b) => ({
+  const callers = (name: string) =>
+    config.protectCallers && owners.some((owner) => index.refs.get(name)?.has(owner));
+  const isProtected = (name: string) => pinnedSet.has(name) || fresh.has(name) || callers(name);
+  const text = owners.map((name) => `${name.replace(/-/g, " ")} ${descriptions.get(name) ?? ""}`).join("\n");
+  // The new skill is the topic signal, so never abstain here.
+  const options = { ...relevanceOptions(config), minSignal: 0 };
+  return evictUnrelated(text, loaded, index, isProtected, config, options, fresh).map((b) => ({
     ...b,
     reason: b.reason.startsWith("over maxKeep") || b.reason === "skill no longer installed"
       ? b.reason

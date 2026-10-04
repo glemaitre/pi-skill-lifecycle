@@ -236,3 +236,89 @@ describe.skipIf(!process.env.PI_E2E)("pi end-to-end: helper skill", () => {
     expect(helper.text).toContain("Instructions.");
   });
 });
+
+/**
+ * No config file: the entry skill is inferred (its body mentions every other
+ * skill), and persist-ml-git declares `metadata.role: helper`. Loading the
+ * helper keeps the caller; loading an unrelated stage archives both, while
+ * the inferred entry skill stays pinned.
+ */
+describe.skipIf(!process.env.PI_E2E)("pi end-to-end: derived roles without config", () => {
+  const DERIVED_SCRIPT = [
+    { tool: "skill", args: { name: "triage-ml-task" } },
+    { tool: "skill", args: { name: "explore-ml-data" } },
+    { tool: "skill", args: { name: "persist-ml-git" } },
+    { tool: "skill", args: { name: "setup-ml-project" } },
+    { text: "done" },
+  ];
+  const DERIVED_SKILLS: Record<string, { description: string; frontmatter?: string; intro?: string }> = {
+    "triage-ml-task": {
+      description: "Route an ambiguous request to the right skill.",
+      intro: "Route to `explore-ml-data`, `setup-ml-project`, or `persist-ml-git`.",
+    },
+    "explore-ml-data": { description: "Explore and profile the data before modelling.", intro: "Then load `persist-ml-git`." },
+    "setup-ml-project": { description: "Set up and bootstrap a new ML workspace." },
+    "persist-ml-git": { description: "Commit the stage with git.", frontmatter: "metadata:\n  role: helper" },
+  };
+  let workspace: string;
+  let requests: any[];
+
+  beforeAll(() => {
+    workspace = mkdtempSync(join(tmpdir(), "skill-lifecycle-e2e-derived-"));
+    for (const [name, spec] of Object.entries(DERIVED_SKILLS)) {
+      const dir = join(workspace, ".agents", "skills", name);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, "SKILL.md"),
+        `---\nname: ${name}\ndescription: ${spec.description}\n${spec.frontmatter ? spec.frontmatter + "\n" : ""}---\n\n# ${name}\n\n${spec.intro ?? ""}\n\n${"Instructions. ".repeat(400)}\n`,
+      );
+    }
+    execFileSync(
+      PI,
+      [
+        "-p", "--offline", "--approve", "--no-extensions",
+        "-e", join(ROOT, "extensions", "index.ts"),
+        "-e", join(ROOT, "tests", "e2e", "scripted-provider.ts"),
+        "--model", "scripted/m",
+        "--session-dir", join(workspace, "sessions"),
+        "I would like to explore the data",
+      ],
+      {
+        cwd: workspace,
+        env: {
+          ...process.env,
+          PI_CODING_AGENT_DIR: join(workspace, "agent"),
+          E2E_LOG: join(workspace, "requests.jsonl"),
+          E2E_SCRIPT: JSON.stringify(DERIVED_SCRIPT),
+        },
+        stdio: "pipe",
+        timeout: 60_000,
+      },
+    );
+    requests = readFileSync(join(workspace, "requests.jsonl"), "utf-8").trim().split("\n").map((line) => JSON.parse(line));
+  }, 100_000);
+
+  afterAll(() => {
+    if (workspace) rmSync(workspace, { recursive: true, force: true });
+  });
+
+  const skillResults = (request: any) => request.messages.filter((m: any) => m.toolName === "skill");
+
+  it("names the inferred entry skill in the protocol", () => {
+    expect(requests[0].system[0]).toContain('skill("triage-ml-task")');
+  });
+
+  it("keeps the caller when a declared helper is loaded", () => {
+    const [, explore, persist] = skillResults(requests[3]);
+    expect(explore.text).toContain("Instructions.");
+    expect(persist.text).toContain("Instructions.");
+  });
+
+  it("archives the caller and the helper when an unrelated stage is loaded, keeping the entry skill", () => {
+    const [triage, explore, persist, setup] = skillResults(requests[4]);
+    expect(triage.text).toContain("Instructions.");
+    expect(explore.text).toContain("Skill body archived");
+    expect(persist.text).toContain("Skill body archived");
+    expect(setup.text).toContain("Instructions.");
+  });
+});

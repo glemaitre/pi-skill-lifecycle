@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, Skill as PiSkill } from "@earendil-works/pi-coding-agent";
@@ -19,6 +19,7 @@ import {
   normalizeBuildSystemPromptOptions,
 } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/system-prompt.js";
 import extension from "../extensions/index.ts";
+import { PACK } from "./fixtures.ts";
 
 // ── Fixtures ──────────────────────────────────────────────────────
 
@@ -29,6 +30,8 @@ interface SkillSpec {
   description: string;
   body?: string;
   disableModelInvocation?: boolean;
+  /** Extra frontmatter lines, e.g. "metadata:\n  role: helper". */
+  frontmatter?: string;
 }
 
 function writeSkills(root: string, specs: SkillSpec[]): PiSkill[] {
@@ -38,7 +41,7 @@ function writeSkills(root: string, specs: SkillSpec[]): PiSkill[] {
     const filePath = join(baseDir, "SKILL.md");
     writeFileSync(
       filePath,
-      `---\nname: ${spec.name}\ndescription: ${spec.description}\n---\n\n${spec.body ?? `Body of ${spec.name}.`}\n`,
+      `---\nname: ${spec.name}\ndescription: ${spec.description}\n${spec.frontmatter ? `${spec.frontmatter}\n` : ""}---\n\n${spec.body ?? `Body of ${spec.name}.`}\n`,
     );
     writeFileSync(join(baseDir, "references", "notes.md"), "notes");
     return {
@@ -198,9 +201,9 @@ function writeProjectConfig(config: object) {
   writeFileSync(join(root, ".pi", "skill-lifecycle.json"), JSON.stringify(config));
 }
 
-async function startSession(config?: object, activeTools?: string[], trusted = true) {
+async function startSession(config?: object, activeTools?: string[], trusted = true, withSkills = skills) {
   if (config) writeProjectConfig(config);
-  const harness = createHarness(root, skills, activeTools, trusted);
+  const harness = createHarness(root, withSkills, activeTools, trusted);
   await harness.emit("session_start", { type: "session_start", reason: "startup" });
   return harness;
 }
@@ -576,5 +579,135 @@ describe("config location", () => {
     const listing = h.notifications.at(-1)!;
     expect(listing).toContain("plot-ml-figure 🧩");
     expect(listing).not.toContain("explore-ml-data 🧩");
+  });
+});
+
+// ── Derived roles and relevance (no config) ───────────────────────
+
+describe("derived from the installed skills", () => {
+  const packSpecs = (overrides: Record<string, Partial<SkillSpec>> = {}): SkillSpec[] =>
+    PACK.map((s) => ({ name: s.name, description: s.description, body: s.body, ...overrides[s.name] }));
+  const startPack = (config?: object, overrides?: Record<string, Partial<SkillSpec>>) => {
+    rmSync(join(root, ".agents"), { recursive: true, force: true });
+    const pack = writeSkills(root, packSpecs(overrides));
+    return { pack, session: startSession(config, undefined, true, pack) };
+  };
+
+  it("infers the entry skill from cross-references and names it in the prompt", async () => {
+    const h = await startPack().session;
+    const { sections } = await h.prompt("hello there");
+    expect(sections.skills).toContain('skill("triage-ml-task")');
+  });
+
+  it("pins the inferred entry skill", async () => {
+    const h = await startPack({ minKeep: 0 }).session;
+    await h.prompt("what should I do next");
+    const triage = await h.loadSkill("triage-ml-task");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [triage] });
+    const setup = await h.loadSkill("setup-ml-project");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [setup] });
+    const out = await h.context([triage, setup]);
+    expect(out.some(isPlaceholder)).toBe(false);
+  });
+
+  it("does not infer an entry skill when inference is off", async () => {
+    const h = await startPack({ inferEntrySkill: false }).session;
+    expect((await h.prompt("hello there")).sections.skills).not.toContain('skill("triage-ml-task")');
+  });
+
+  it("uses an entry skill declared in the frontmatter", async () => {
+    const h = await startPack(undefined, { "setup-ml-project": { frontmatter: "metadata:\n  role: entry" } }).session;
+    const { sections } = await h.prompt("hello there");
+    expect(sections.skills).toContain('skill("setup-ml-project")');
+    expect(sections.skills).not.toContain('skill("triage-ml-task")');
+  });
+
+  it("archives the caller on a mid-run load unless the loaded skill declares itself a helper", async () => {
+    for (const [overrides, archived] of [
+      [{}, true],
+      [{ "persist-ml-git": { frontmatter: "metadata:\n  role: helper" } }, false],
+    ] as const) {
+      const h = await startPack(undefined, overrides).session;
+      await h.prompt("explore the data");
+      const explore = await h.loadSkill("explore-ml-data");
+      await h.emit("turn_end", { type: "turn_end", toolResults: [explore] });
+      const persist = await h.loadSkill("persist-ml-git");
+      await h.emit("turn_end", { type: "turn_end", toolResults: [persist] });
+      const out = await h.context([explore, persist]);
+      expect(isPlaceholder(out[0])).toBe(archived);
+    }
+  });
+
+  it("keeps the caller when the loaded skill is related to it", async () => {
+    const h = await startPack().session;
+    await h.prompt("explore the data");
+    const explore = await h.loadSkill("explore-ml-data");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [explore] });
+    // Build and evaluate share "pipeline"; explore shares nothing with evaluate.
+    const build = await h.loadSkill("build-ml-pipeline");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [build] });
+    const evaluate = await h.loadSkill("evaluate-ml-pipeline");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [evaluate] });
+    const out = await h.context([explore, build, evaluate]);
+    expect(out.map(isPlaceholder)).toEqual([true, false, false]);
+  });
+
+  it("evicts nothing for relevance when the prompt carries no topic signal", async () => {
+    const h = await startPack({ minKeep: 0 }).session;
+    await h.prompt("explore the data");
+    const explore = await h.loadSkill("explore-ml-data");
+    await h.prompt("the frobnicator broke yesterday");
+    expect(isPlaceholder((await h.context([explore]))[0])).toBe(false);
+    await h.prompt("now bootstrap a new project with pixi");
+    expect(isPlaceholder((await h.context([explore]))[0])).toBe(true);
+  });
+
+  it("rebuilds the index when a SKILL.md changes", async () => {
+    const { pack, session } = startPack();
+    const h = await session;
+    await h.prompt("hello there");
+    await h.commands.get("skills-list").handler("", h.ctx);
+    expect(h.notifications.at(-1)).not.toContain("persist-ml-git 🧩");
+
+    const persist = pack.find((s) => s.name === "persist-ml-git")!;
+    writeFileSync(persist.filePath, `---\nname: persist-ml-git\ndescription: ${persist.description}\nmetadata:\n  role: helper\n---\n\nRun git commit.\n`);
+    const later = new Date(Date.now() + 5000);
+    utimesSync(persist.filePath, later, later);
+    await h.prompt("commit this with git");
+    await h.commands.get("skills-list").handler("", h.ctx);
+    expect(h.notifications.at(-1)).toContain("persist-ml-git 🧩 (frontmatter)");
+  });
+
+  it("shows roles and their source in /skills-list", async () => {
+    const h = await startPack({ helperSkills: ["plot-ml-figure"] }).session;
+    await h.prompt("hello there");
+    await h.commands.get("skills-list").handler("", h.ctx);
+    const listing = h.notifications.at(-1)!;
+    expect(listing).toContain("triage-ml-task 📌 🚪 (inferred)");
+    expect(listing).toContain("plot-ml-figure 🧩 (config)");
+  });
+
+  it("/skills-explain ranks the skills and explains each loaded body", async () => {
+    const h = await startPack({ minKeep: 0 }).session;
+    await h.prompt("explore the data");
+    await h.loadSkill("explore-ml-data");
+    await h.loadSkill("setup-ml-project");
+    await h.commands.get("skills-explain").handler("draw a chart with matplotlib", h.ctx);
+    const text = h.notifications.at(-1)!;
+    expect(text).toContain("Entry skill: triage-ml-task (inferred)");
+    expect(text).toMatch(/✓ plot-ml-figure\s+\d/);
+    expect(text).toMatch(/setup-ml-project — archived: no match/);
+
+    await h.commands.get("skills-explain").handler("the frobnicator broke", h.ctx);
+    expect(h.notifications.at(-1)).toContain("nothing would be archived");
+  });
+
+  it("/skills-explain without a prompt shows roles and usage", async () => {
+    const h = await startPack().session;
+    await h.commands.get("skills-explain").handler("", h.ctx);
+    expect(h.notifications.at(-1)).toContain("No skills known yet");
+    await h.prompt("hello there");
+    await h.commands.get("skills-explain").handler("", h.ctx);
+    expect(h.notifications.at(-1)).toContain("Usage: /skills-explain <prompt>");
   });
 });

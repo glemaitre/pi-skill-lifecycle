@@ -1,301 +1,126 @@
 /**
- * Tests for the relevance engine (pure logic).
- *
- * Run: npx vitest run
- * Watch: npx vitest
+ * Tests for configuration, roles, and eviction decisions (rules.ts).
  */
 
 import { describe, it, expect } from "vitest";
+import { buildSkillIndex } from "../extensions/relevance.ts";
 import {
-  tokenize,
-  scoreRelevance,
-  selectRelevantSkills,
+  buildPlaceholder,
   configWithDefaults,
   DEFAULT_CONFIG,
-  buildChangeSummary,
-  isMinorChange,
-  fingerprintPrompt,
   extractSkillNameFromContent,
-  buildPlaceholder,
+  fingerprintPrompt,
+  isMinorChange,
+  resolveRoles,
+  ruleScore,
   selectBodiesSupersededBy,
   selectBodiesToEvict,
 } from "../extensions/rules.ts";
-import type { Skill, RelevanceRule } from "../extensions/rules.ts";
+import { PACK } from "./fixtures.ts";
 
-// ── Fixtures ──────────────────────────────────────────────────────
-
-function makeSkill(overrides: Partial<Skill> & { name: string }): Skill {
-  return {
-    description: "Default test skill description",
-    filePath: `/skills/${overrides.name}/SKILL.md`,
-    baseDir: `/skills/${overrides.name}`,
-    disableModelInvocation: false,
-    ...overrides,
-  };
-}
-
-const makeSut = () => {
-  const buildSkill = makeSkill;
-  return { buildSkill };
-};
-
-const NO_RULES: RelevanceRule[] = [];
-
-// ── tokenize ──────────────────────────────────────────────────────
-
-describe("tokenize", () => {
-  it("splits on punctuation and whitespace", () => {
-    const t = tokenize("hello, world! build-ml-pipeline?");
-    // "ml" is filtered out (2 chars), hyphen splits the compound name
-    expect([...t]).toEqual(["hello", "world", "build", "pipeline"]);
-  });
-
-  it("excludes words shorter than 3 characters", () => {
-    const t = tokenize("a an of ml pi data");
-    expect([...t]).toEqual(["data"]);
-  });
-
-  it("excludes stopwords so filler words do not count as overlap", () => {
-    const t = tokenize("the data and the pipeline for you");
-    expect([...t]).toEqual(["data", "pipeline"]);
-  });
-
-  it("lowercases everything", () => {
-    const t = tokenize("Hello World BUILD");
-    expect([...t]).toEqual(["hello", "world", "build"]);
-  });
-
-  it("handles empty input", () => {
-    expect([...tokenize("")]).toEqual([]);
-  });
-});
-
-// ── scoreRelevance ────────────────────────────────────────────────
-
-describe("scoreRelevance", () => {
-  it("returns 0 for a skill with no match", () => {
-    const skill = makeSkill({
-      name: "pdf-tools",
-      description: "Extract text and tables from PDF files",
-    });
-    const { score, reason } = scoreRelevance("build a classifier with sklearn", skill, NO_RULES);
-    expect(score).toBe(0);
-    expect(reason).toBe("no match");
-  });
-
-  it("scores based on description token overlap", () => {
-    const skill = makeSkill({
-      name: "build-ml-pipeline",
-      description: "Declare the pipeline from data source to predictor as a skrub DataOps graph",
-    });
-    const { score } = scoreRelevance("I want to build a pipeline for my data", skill, NO_RULES);
-    expect(score).toBeGreaterThan(0);
-  });
-
-  it("gives a boost when the skill name appears in the prompt", () => {
-    const skill = makeSkill({
-      name: "audit-ml-pipeline",
-      description: "Review past experiments",
-    });
-    const { score, reason } = scoreRelevance("run an audit on experiment 5", skill, NO_RULES);
-    expect(score).toBeGreaterThan(0);
-    expect(reason).toContain("skill name found");
-  });
-
-  it("uses explicit rules when they exist", () => {
-    const skill = makeSkill({ name: "explore-ml-data", description: "Data exploration" });
-    const rules: RelevanceRule[] = [
-      { skillName: "explore-ml-data", keywords: ["explore", "eda", "profile", "data analysis"] },
-    ];
-    const { score, reason } = scoreRelevance("I need to explore the data and run EDA", skill, rules);
-    expect(score).toBeGreaterThan(0);
-    expect(reason).toContain("rule matched");
-  });
-
-  it("applies rule weight multiplier", () => {
-    const skill = makeSkill({ name: "explore-ml-data", description: "Data exploration" });
-    const rules: RelevanceRule[] = [
-      {
-        skillName: "explore-ml-data",
-        keywords: ["explore", "eda", "data analysis"],
-        weight: 2.0,
-      },
-    ];
-    const { score } = scoreRelevance("explore the data", skill, rules);
-    // 1/3 keywords * 2.0 weight = 0.66, capped at 1
-    expect(score).toBeGreaterThan(0.5);
-  });
-
-  it("caps score at 1.0", () => {
-    const skill = makeSkill({ name: "test", description: "a" });
-    const rules: RelevanceRule[] = [
-      {
-        skillName: "test",
-        keywords: ["hello", "world"],
-        weight: 10,
-      },
-    ];
-    const { score } = scoreRelevance("hello world", skill, rules);
-    expect(score).toBe(1.0);
-  });
-});
-
-// ── selectRelevantSkills ──────────────────────────────────────────
-
-describe("selectRelevantSkills", () => {
-  const cfg = configWithDefaults({ threshold: 0.01, minKeep: 2 });
-
-  const skills = [
-    makeSkill({ name: "build-ml-pipeline", description: "Build sklearn pipelines with skrub DataOps" }),
-    makeSkill({ name: "explore-ml-data", description: "Profile and understand raw data before modeling" }),
-    makeSkill({ name: "evaluate-ml-pipeline", description: "Run cross-validation and scoring" }),
-    makeSkill({ name: "audit-ml-pipeline", description: "Review past experiment reports" }),
-    makeSkill({ name: "frame-ml-problem", description: "Lock problem type, metric, baseline, and split" }),
-    makeSkill({ name: "model-ml-pipeline", description: "Coordinate model design and experiments" }),
-  ];
-
-  it("keeps all skills when count <= minKeep", () => {
-    const { kept, dropped } = selectRelevantSkills(
-      "anything",
-      skills.slice(0, 2),
-      new Set(),
-      cfg,
-    );
-    expect(kept.length).toBe(2);
-    expect(dropped).toEqual([]);
-  });
-
-  it("keeps pinned skills regardless of prompt", () => {
-    const pinned = new Set(["audit-ml-pipeline"]);
-    const { kept, dropped } = selectRelevantSkills(
-      "build a classifier with sklearn",
-      skills,
-      pinned,
-      cfg,
-    );
-    const keptNames = kept.map((s) => s.name);
-    expect(keptNames).toContain("audit-ml-pipeline");
-    expect(keptNames).toContain("build-ml-pipeline"); // best match
-  });
-
-  it("drops skills below threshold", () => {
-    const strictCfg = configWithDefaults({ threshold: 0.3, minKeep: 1 });
-    const { kept, dropped } = selectRelevantSkills(
-      "build a classifier with sklearn",
-      skills,
-      new Set(),
-      strictCfg,
-    );
-    const keptNames = kept.map((s) => s.name);
-    const droppedNames = dropped.map((s) => s.skill.name);
-    expect(keptNames).toContain("build-ml-pipeline");
-    // Some should have been dropped
-    expect(dropped.length).toBeGreaterThan(0);
-  });
-
-  it("ensures at least minKeep skills survive", () => {
-    const minKeepCfg = configWithDefaults({ threshold: 0.9, minKeep: 3 });
-    const { kept } = selectRelevantSkills(
-      "i love cats a lot meow",
-      skills,
-      new Set(),
-      minKeepCfg,
-    );
-    expect(kept.length).toBe(3);
-  });
-
-  it("caps at maxKeep when set", () => {
-    const maxCfg = configWithDefaults({ threshold: 0, minKeep: 1, maxKeep: 2 });
-    const { kept } = selectRelevantSkills(
-      "build pipeline explore data evaluate model audit frame",
-      skills,
-      new Set(),
-      maxCfg,
-    );
-    expect(kept.length).toBeLessThanOrEqual(2);
-  });
-
-  it("returns all skills when empty prompt is given and minKeep > total", () => {
-    const { kept } = selectRelevantSkills("", skills.slice(0, 1), new Set(), cfg);
-    expect(kept.length).toBe(1);
-  });
-
-  it("returns empty for empty skills input", () => {
-    const { kept, dropped } = selectRelevantSkills("anything", [], new Set(), cfg);
-    expect(kept).toEqual([]);
-    expect(dropped).toEqual([]);
-  });
-
-  it("drops skills with score 0 unless needed for minKeep", () => {
-    const { kept, dropped } = selectRelevantSkills(
-      "quantum physics",
-      skills,
-      new Set(),
-      configWithDefaults({ threshold: 0.5, minKeep: 1 }),
-    );
-    // Most skills should have near-0 scores
-    const keptNames = kept.map((s) => s.name);
-    expect(kept.length).toBe(1); // minKeep
-    expect(dropped.length).toBe(skills.length - 1);
-  });
-});
-
-// ── buildChangeSummary ────────────────────────────────────────────
-
-describe("buildChangeSummary", () => {
-  it("returns empty string when nothing was dropped", () => {
-    const result = buildChangeSummary(
-      [makeSkill({ name: "a" }), makeSkill({ name: "b" })],
-      [],
-      2,
-    );
-    expect(result).toBe("");
-  });
-
-  it("includes kept and dropped names", () => {
-    const result = buildChangeSummary(
-      [makeSkill({ name: "build-ml-pipeline" })],
-      [{ skill: makeSkill({ name: "audit-ml-pipeline" }), score: 0.05, reason: "no match" }],
-      2,
-    );
-    expect(result).toContain("build-ml-pipeline");
-    expect(result).toContain("audit-ml-pipeline");
-    expect(result).toContain("5%");
-  });
-});
+const index = buildSkillIndex(PACK);
+const descriptions = new Map(PACK.map((s) => [s.name, s.description]));
+const names = (out: Array<{ name: string }>) => out.map((e) => e.name).sort();
+const loadedInOrder = (...skillNames: string[]) => skillNames.map((name, i) => ({ name, seq: i + 1 }));
 
 // ── configWithDefaults ────────────────────────────────────────────
 
 describe("configWithDefaults", () => {
-  it("fills all fields from DEFAULT_CONFIG when given empty object", () => {
-    const cfg = configWithDefaults({});
-    expect(cfg.threshold).toBe(DEFAULT_CONFIG.threshold);
-    expect(cfg.minKeep).toBe(DEFAULT_CONFIG.minKeep);
-    expect(cfg.rules).toEqual([]);
-    expect(cfg.pinned).toEqual([]);
-    expect(cfg.entrySkill).toBe("");
-    expect(cfg.pinEntrySkill).toBe(true);
-    expect(cfg.helperSkills).toEqual([]);
-    expect(cfg.blockDirectSkillReads).toBe(true);
-    expect(cfg.skipOnShortPrompts).toBe(true);
-    expect(cfg.minScorablePromptLength).toBe(15);
-    expect(cfg.topicChangeThreshold).toBe(0.7);
+  it("fills every field from DEFAULT_CONFIG", () => {
+    expect(configWithDefaults({})).toEqual(DEFAULT_CONFIG);
+    expect(configWithDefaults()).toEqual(DEFAULT_CONFIG);
   });
 
-  it("preserves fields that are set", () => {
-    const cfg = configWithDefaults({ threshold: 0.5, pinned: ["test"] });
-    expect(cfg.threshold).toBe(0.5);
-    expect(cfg.minKeep).toBe(DEFAULT_CONFIG.minKeep);
-    expect(cfg.pinned).toEqual(["test"]);
-    expect(cfg.rules).toEqual([]);
-    expect(cfg.blockDirectSkillReads).toBe(true);
-    expect(cfg.skipOnShortPrompts).toBe(true);
+  it("needs no keyword rules, helpers, or entry skill by default", () => {
+    expect(DEFAULT_CONFIG.rules).toEqual([]);
+    expect(DEFAULT_CONFIG.helperSkills).toEqual([]);
+    expect(DEFAULT_CONFIG.entrySkill).toBe("");
+    expect(DEFAULT_CONFIG.inferEntrySkill).toBe(true);
   });
 
-  it("keeps explicit false and empty values", () => {
-    const cfg = configWithDefaults({ blockDirectSkillReads: false, entrySkill: "triage-ml-task" });
+  it("keeps explicit values, including false, 0, and empty strings", () => {
+    const cfg = configWithDefaults({ blockDirectSkillReads: false, minKeep: 0, topK: 5, entrySkill: "x" });
     expect(cfg.blockDirectSkillReads).toBe(false);
-    expect(cfg.entrySkill).toBe("triage-ml-task");
+    expect(cfg.minKeep).toBe(0);
+    expect(cfg.topK).toBe(5);
+    expect(cfg.entrySkill).toBe("x");
+  });
+
+  it("falls back to defaults for null and undefined, and drops unknown keys", () => {
+    const cfg = configWithDefaults({ topK: null, minKeep: undefined, bogus: 1 } as any);
+    expect(cfg.topK).toBe(DEFAULT_CONFIG.topK);
+    expect(cfg.minKeep).toBe(DEFAULT_CONFIG.minKeep);
+    expect("bogus" in cfg).toBe(false);
+  });
+});
+
+// ── resolveRoles ──────────────────────────────────────────────────
+
+describe("resolveRoles", () => {
+  it("uses the inferred entry skill without config", () => {
+    expect(resolveRoles(index, configWithDefaults()).entry).toEqual({ name: "triage-ml-task", source: "inferred" });
+  });
+
+  it("lets the config entry override frontmatter and inference", () => {
+    const declared = buildSkillIndex(PACK.map((s) => (s.name === "explore-ml-data" ? { ...s, metadata: { role: "entry" } } : s)));
+    expect(resolveRoles(declared, configWithDefaults({ entrySkill: "setup-ml-project" })).entry).toEqual({
+      name: "setup-ml-project",
+      source: "config",
+    });
+    expect(resolveRoles(declared, configWithDefaults()).entry).toEqual({ name: "explore-ml-data", source: "frontmatter" });
+  });
+
+  it("can turn inference off, but keeps a frontmatter entry", () => {
+    const off = configWithDefaults({ inferEntrySkill: false });
+    expect(resolveRoles(index, off).entry).toBeUndefined();
+    const declared = buildSkillIndex(PACK.map((s) => (s.name === "explore-ml-data" ? { ...s, metadata: { role: "entry" } } : s)));
+    expect(resolveRoles(declared, off).entry?.name).toBe("explore-ml-data");
+  });
+
+  it("has no entry when the configured one is not installed", () => {
+    expect(resolveRoles(index, configWithDefaults({ entrySkill: "nope" })).entry).toBeUndefined();
+  });
+
+  it("merges helpers from the frontmatter and the config, installed only", () => {
+    const declared = buildSkillIndex(PACK.map((s) => (s.name === "persist-ml-git" ? { ...s, metadata: { role: "helper" } } : s)));
+    const roles = resolveRoles(declared, configWithDefaults({ helperSkills: ["plot-ml-figure", "nope"] }));
+    expect([...roles.helpers]).toEqual([
+      ["persist-ml-git", "frontmatter"],
+      ["plot-ml-figure", "config"],
+    ]);
+  });
+
+  it("never treats the entry skill as a helper", () => {
+    const roles = resolveRoles(index, configWithDefaults({ helperSkills: ["triage-ml-task"] }));
+    expect(roles.helpers.has("triage-ml-task")).toBe(false);
+  });
+
+  it("keeps configured names before the skills are known", () => {
+    const roles = resolveRoles(buildSkillIndex([]), configWithDefaults({ entrySkill: "triage-ml-task", helperSkills: ["x"] }));
+    expect(roles.entry?.name).toBe("triage-ml-task");
+    expect(roles.helpers.has("x")).toBe(true);
+  });
+});
+
+// ── ruleScore ─────────────────────────────────────────────────────
+
+describe("ruleScore", () => {
+  const rules = [{ skillName: "explore-ml-data", keywords: ["eda", "profile", "data analysis"] }];
+
+  it("is the fraction of matched keywords, as substrings, case-insensitive", () => {
+    expect(ruleScore("Run the EDA and the data analysis", "explore-ml-data", rules).score).toBeCloseTo(2 / 3);
+    expect(ruleScore("eda", "explore-ml-data", rules).reason).toBe("rule matched 1/3 keywords");
+  });
+
+  it("applies the weight, capped at 1", () => {
+    expect(ruleScore("eda", "explore-ml-data", [{ ...rules[0], weight: 2 }]).score).toBeCloseTo(2 / 3);
+    expect(ruleScore("eda profile", "explore-ml-data", [{ ...rules[0], weight: 10 }]).score).toBe(1);
+  });
+
+  it("is 0 for other skills, no match, or empty keyword lists", () => {
+    expect(ruleScore("eda", "build-ml-pipeline", rules).score).toBe(0);
+    expect(ruleScore("nothing", "explore-ml-data", rules).score).toBe(0);
+    expect(ruleScore("eda", "x", [{ skillName: "x", keywords: [] }]).score).toBe(0);
   });
 });
 
@@ -303,286 +128,173 @@ describe("configWithDefaults", () => {
 
 describe("isMinorChange", () => {
   const cfg = configWithDefaults({});
+  const prev = fingerprintPrompt("build a random forest classifier with sklearn");
 
-  it("returns false when there is no previous fingerprint (first turn)", () => {
+  it("scores the first prompt", () => {
     expect(isMinorChange("build a classifier", undefined, cfg)).toBe(false);
-  });
-
-  it("returns false when previous fingerprint is empty", () => {
     expect(isMinorChange("build a classifier", new Set(), cfg)).toBe(false);
   });
 
-  it("returns true for very short prompts (acknowledgements)", () => {
-    const prev = fingerprintPrompt("build a classifier with sklearn");
-    expect(isMinorChange("yes", prev, cfg)).toBe(true);
-    expect(isMinorChange("ok", prev, cfg)).toBe(true);
-    expect(isMinorChange("run it", prev, cfg)).toBe(true);
-    expect(isMinorChange("continue", prev, cfg)).toBe(true);
+  it("skips short follow-ups, unless disabled", () => {
+    for (const p of ["yes", "ok", "run it", "continue", "go ahead"]) expect(isMinorChange(p, prev, cfg)).toBe(true);
+    expect(isMinorChange("use pixi", prev, configWithDefaults({ skipOnShortPrompts: false }))).toBe(false);
   });
 
-  it("returns true when the prompt length is below minScorablePromptLength", () => {
-    const prev = fingerprintPrompt("build a classifier with sklearn");
-    // "go ahead" is 8 chars, below default of 15
-    expect(isMinorChange("go ahead", prev, cfg)).toBe(true);
+  it("respects minScorablePromptLength", () => {
+    const short = configWithDefaults({ minScorablePromptLength: 5 });
+    expect(isMinorChange("hello", prev, short)).toBe(false);
+    expect(isMinorChange("hi", prev, short)).toBe(true);
   });
 
-  it("respects a custom minScorablePromptLength", () => {
-    const shortCfg = configWithDefaults({ minScorablePromptLength: 5, skipOnShortPrompts: true });
-    const prev = fingerprintPrompt("build a classifier");
-    // "hello" is 5 chars, not below threshold
-    expect(isMinorChange("hello", prev, shortCfg)).toBe(false);
-    // "hi" is 2 chars, below threshold
-    expect(isMinorChange("hi", prev, shortCfg)).toBe(true);
-  });
-
-  it("does not skip short prompts when skipOnShortPrompts is false", () => {
-    const noSkipCfg = configWithDefaults({ skipOnShortPrompts: false });
-    const prev = fingerprintPrompt("build a classifier with sklearn");
-    expect(isMinorChange("yes", prev, noSkipCfg)).toBe(false);
-  });
-
-  it("returns true when high token overlap with previous prompt", () => {
-    const prev = fingerprintPrompt("build a random forest classifier with sklearn");
-    // 4/4 tokens overlap → 1.0 ratio, well above 0.7 threshold
+  it("skips prompts on the same topic and scores topic changes", () => {
     expect(isMinorChange("random forest classifier sklearn", prev, cfg)).toBe(true);
-  });
-
-  it("returns false when topic clearly changed", () => {
-    const prev = fingerprintPrompt("build a random forest classifier with sklearn");
-    // Completely different topic — low token overlap
     expect(isMinorChange("explore the data distributions and outliers", prev, cfg)).toBe(false);
   });
 
-  it("uses topicChangeThreshold from config", () => {
-    // threshold 0.4 means 40%+ overlap needed to consider it the same topic
-    const cfg40 = configWithDefaults({ topicChangeThreshold: 0.4 });
-    const prev = fingerprintPrompt("build a random forest classifier with sklearn");
-    // "build an xgboost model" has 33% overlap (1/3) → below 40% → not minor
-    expect(isMinorChange("build an xgboost model", prev, cfg40)).toBe(false);
-
-    // With threshold 0.2 (only 20% needed), 33% overlap IS enough → minor
-    const cfg20 = configWithDefaults({ topicChangeThreshold: 0.2 });
-    expect(isMinorChange("build an xgboost model", prev, cfg20)).toBe(true);
+  it("uses topicChangeThreshold", () => {
+    // "build an xgboost model": 1 of 3 words overlaps.
+    expect(isMinorChange("build an xgboost model", prev, configWithDefaults({ topicChangeThreshold: 0.4 }))).toBe(false);
+    expect(isMinorChange("build an xgboost model", prev, configWithDefaults({ topicChangeThreshold: 0.2 }))).toBe(true);
   });
 
-  it("returns true when current prompt has no meaningful tokens", () => {
-    const prev = fingerprintPrompt("build a classifier");
-    expect(isMinorChange("a", prev, cfg)).toBe(true);
+  it("skips prompts without meaningful words", () => {
     expect(isMinorChange("", prev, cfg)).toBe(true);
+    expect(isMinorChange("a", prev, cfg)).toBe(true);
   });
 });
 
-// ── extractSkillNameFromContent ───────────────────────────────────
+// ── Skill body helpers ────────────────────────────────────────────
 
 describe("extractSkillNameFromContent", () => {
-  it("extracts skill name from <skill_content> wrapper", () => {
-    const content = [
-      { type: "text", text: '<skill_content name="build-ml-pipeline">\n# Skill: build-ml-pipeline' },
-    ];
-    expect(extractSkillNameFromContent(content)).toBe("build-ml-pipeline");
+  it("finds the <skill_content> wrapper in any text block", () => {
+    expect(extractSkillNameFromContent([{ type: "text", text: '<skill_content name="build-ml-pipeline">\n#' }])).toBe("build-ml-pipeline");
+    expect(
+      extractSkillNameFromContent([
+        { type: "image" } as any,
+        { type: "text", text: "preamble" },
+        { type: "text", text: '<skill_content name="explore-ml-data">' },
+      ]),
+    ).toBe("explore-ml-data");
   });
 
-  it("returns null when content has no skill wrapper", () => {
-    const content = [
-      { type: "text", text: "Some random tool output without skill content" },
-    ];
-    expect(extractSkillNameFromContent(content)).toBeNull();
-  });
-
-  it("returns null for empty content array", () => {
+  it("returns null without a wrapper", () => {
     expect(extractSkillNameFromContent([])).toBeNull();
-  });
-
-  it("scans multiple blocks to find the wrapper", () => {
-    const content = [
-      { type: "text", text: "Some preliminary output" },
-      { type: "text", text: '<skill_content name="explore-ml-data">\n...' },
-    ];
-    expect(extractSkillNameFromContent(content)).toBe("explore-ml-data");
-  });
-
-  it("handles image blocks without crashing", () => {
-    const content = [
-      { type: "image", data: "abc", mimeType: "image/png" } as any,
-    ];
-    expect(extractSkillNameFromContent(content)).toBeNull();
-  });
-
-  it("handles mixed image and text blocks", () => {
-    const content = [
-      { type: "image", data: "abc", mimeType: "image/png" } as any,
-      { type: "text", text: '<skill_content name="audit-ml-pipeline">' },
-    ];
-    expect(extractSkillNameFromContent(content)).toBe("audit-ml-pipeline");
-  });
-
-  it("matches only <skill_content> open tags, not text containing it", () => {
-    const content = [
-      { type: "text", text: "some text <skill_content name=\"something\"> else" },
-    ];
-    expect(extractSkillNameFromContent(content)).toBe("something");
+    expect(extractSkillNameFromContent([{ type: "text", text: "plain output" }])).toBeNull();
   });
 });
-
-// ── buildPlaceholder ──────────────────────────────────────────────
 
 describe("buildPlaceholder", () => {
-  it("wraps skill name in a <skill_content> placeholder", () => {
-    const result = buildPlaceholder("build-ml-pipeline");
-    expect(result).toContain('<skill_content name="build-ml-pipeline">');
-    expect(result).toContain("</skill_content>");
-    expect(result).toContain("archived to save context");
+  it("keeps the wrapper and tells the model how to reload", () => {
+    const text = buildPlaceholder("build-ml-pipeline");
+    expect(text).toMatch(/^<skill_content name="build-ml-pipeline">/);
+    expect(text).toMatch(/<\/skill_content>$/);
+    expect(text).toContain("archived to save context");
+    expect(text).toContain('skill("build-ml-pipeline")');
     // Mid-run archives happen without a topic change; do not claim one.
-    expect(result).not.toContain("topic");
-    expect(result).toContain('skill("build-ml-pipeline")');
-  });
-
-  it("tells the model it can reload the skill", () => {
-    const result = buildPlaceholder("explore-ml-data");
-    expect(result).toContain("reload it if you need its instructions again");
-  });
-
-  it("produces valid XML-like tags", () => {
-    const result = buildPlaceholder("test-skill");
-    expect(result).toMatch(/^<skill_content/);
-    expect(result).toMatch(/<\/skill_content>$/);
+    expect(text).not.toContain("topic");
   });
 });
+
 // ── selectBodiesToEvict ───────────────────────────────────────────
 
 describe("selectBodiesToEvict", () => {
-  const skills = new Map(
-    [
-      makeSkill({ name: "explore-ml-data", description: "Explore and profile the data" }),
-      makeSkill({ name: "setup-ml-project", description: "Set up and bootstrap a workspace" }),
-      makeSkill({ name: "build-ml-pipeline", description: "Build a skrub pipeline" }),
-    ].map((s) => [s.name, s]),
-  );
-  const loaded = [
-    { name: "explore-ml-data", seq: 1 },
-    { name: "setup-ml-project", seq: 2 },
-    { name: "build-ml-pipeline", seq: 3 },
-  ];
-  const names = (out: Array<{ name: string }>) => out.map((e) => e.name).sort();
+  const loaded = loadedInOrder("explore-ml-data", "setup-ml-project", "build-ml-pipeline");
 
-  it("protects the minKeep most recent bodies even with no keyword match", () => {
-    const out = selectBodiesToEvict("unrelated words here", loaded, skills, new Set(), configWithDefaults({ minKeep: 2 }));
+  it("evicts bodies whose skills are not relevant to the prompt", () => {
+    const out = selectBodiesToEvict("evaluate the pipeline with cross-validation", loaded, index, new Set(), configWithDefaults({ minKeep: 0 }));
+    // build-ml-pipeline shares "pipeline" with the best match and stays.
+    expect(names(out)).toEqual(["explore-ml-data", "setup-ml-project"]);
+    expect(out[0].reason).toMatch(/no match|rank/);
+  });
+
+  it("protects the minKeep most recent bodies", () => {
+    const out = selectBodiesToEvict("draw a chart with matplotlib", loaded, index, new Set(), configWithDefaults({ minKeep: 2 }));
     expect(names(out)).toEqual(["explore-ml-data"]);
   });
 
   it("keeps an old body that is still relevant", () => {
-    const out = selectBodiesToEvict("explore the data again", loaded, skills, new Set(), configWithDefaults({ minKeep: 1 }));
-    expect(names(out)).toEqual(["setup-ml-project"]);
+    const out = selectBodiesToEvict("explore the data again", loaded, index, new Set(), configWithDefaults({ minKeep: 1 }));
+    expect(names(out)).not.toContain("explore-ml-data");
+    expect(names(out)).toContain("setup-ml-project");
   });
 
   it("never evicts pinned bodies", () => {
-    const out = selectBodiesToEvict("unrelated", loaded, skills, new Set(["explore-ml-data"]), configWithDefaults({ minKeep: 0 }));
+    const out = selectBodiesToEvict("draw a chart with matplotlib", loaded, index, new Set(["explore-ml-data"]), configWithDefaults({ minKeep: 0 }));
     expect(names(out)).toEqual(["build-ml-pipeline", "setup-ml-project"]);
   });
 
+  it("evicts nothing for relevance when the prompt carries no topic signal", () => {
+    const out = selectBodiesToEvict("please fix it", loaded, index, new Set(), configWithDefaults({ minKeep: 0 }));
+    expect(out).toEqual([]);
+  });
+
+  it("lets a keyword rule keep a body the index would evict", () => {
+    const config = configWithDefaults({ minKeep: 0, rules: [{ skillName: "setup-ml-project", keywords: ["matplotlib"] }] });
+    const out = selectBodiesToEvict("draw a chart with matplotlib", loaded, index, new Set(), config);
+    expect(names(out)).toEqual(["build-ml-pipeline", "explore-ml-data"]);
+  });
+
   it("evicts bodies of skills that are no longer installed", () => {
-    const out = selectBodiesToEvict("explore", [{ name: "gone", seq: 0 }, ...loaded], skills, new Set(), configWithDefaults({ minKeep: 3 }));
-    expect(names(out)).toEqual(["gone"]);
+    const out = selectBodiesToEvict("please fix it", [{ name: "gone", seq: 0 }, ...loaded], index, new Set(), configWithDefaults({ minKeep: 3 }));
+    expect(out).toEqual([{ name: "gone", reason: "skill no longer installed" }]);
   });
 
   it("caps the total with maxKeep by evicting the oldest unprotected survivors", () => {
-    const out = selectBodiesToEvict(
-      "explore data, set up workspace, build pipeline",
-      loaded,
-      skills,
-      new Set(),
-      configWithDefaults({ minKeep: 1, maxKeep: 2 }),
-    );
-    expect(out).toEqual([{ name: "explore-ml-data", score: 0, reason: "over maxKeep (2)" }]);
+    const out = selectBodiesToEvict("please fix it", loaded, index, new Set(), configWithDefaults({ minKeep: 1, maxKeep: 2 }));
+    expect(out).toEqual([{ name: "explore-ml-data", reason: "over maxKeep (2)" }]);
   });
 
   it("returns nothing when nothing is loaded", () => {
-    expect(selectBodiesToEvict("x", [], skills, new Set(), configWithDefaults())).toEqual([]);
+    expect(selectBodiesToEvict("explore", [], index, new Set(), configWithDefaults())).toEqual([]);
   });
 });
 
 // ── selectBodiesSupersededBy ──────────────────────────────────────
 
 describe("selectBodiesSupersededBy", () => {
-  const skills = new Map(
-    [
-      makeSkill({ name: "explore-ml-data", description: "Explore and profile the data" }),
-      makeSkill({ name: "setup-ml-project", description: "Set up and bootstrap a workspace" }),
-      makeSkill({ name: "build-ml-pipeline", description: "Build a skrub pipeline from the data" }),
-    ].map((s) => [s.name, s]),
-  );
-  const names = (out: Array<{ name: string }>) => out.map((e) => e.name).sort();
+  const supersede = (fresh: string[], loaded: Array<{ name: string; seq: number }>, opts: object = {}, pins: string[] = [], helpers: string[] = []) =>
+    selectBodiesSupersededBy(fresh, loaded, index, new Set(pins), new Set(helpers), configWithDefaults(opts), descriptions);
 
   it("evicts bodies unrelated to the new skill, ignoring minKeep", () => {
-    const loaded = [
-      { name: "explore-ml-data", seq: 1 },
-      { name: "setup-ml-project", seq: 2 },
-    ];
-    const out = selectBodiesSupersededBy(["setup-ml-project"], loaded, skills, new Set(), configWithDefaults({ minKeep: 5 }));
+    const out = supersede(["persist-ml-git"], loadedInOrder("explore-ml-data", "persist-ml-git"), { minKeep: 5 });
     expect(names(out)).toEqual(["explore-ml-data"]);
-    expect(out[0].reason).toContain("superseded by setup-ml-project");
+    expect(out[0].reason).toContain("superseded by persist-ml-git");
   });
 
-  it("keeps bodies related to the new skill's description", () => {
-    const loaded = [
-      { name: "explore-ml-data", seq: 1 },
-      { name: "build-ml-pipeline", seq: 2 },
-    ];
-    // "data" appears in both descriptions.
-    expect(selectBodiesSupersededBy(["build-ml-pipeline"], loaded, skills, new Set(), configWithDefaults())).toEqual([]);
+  it("keeps bodies related to the new skill", () => {
+    // Build and evaluate share "ml pipeline" and "data".
+    expect(supersede(["evaluate-ml-pipeline"], loadedInOrder("build-ml-pipeline", "evaluate-ml-pipeline"))).toEqual([]);
+  });
+
+  it("never abstains: with no shared terms everything unprotected goes", () => {
+    const out = supersede(["persist-ml-git"], loadedInOrder("plot-ml-figure", "explore-ml-data", "persist-ml-git"));
+    expect(names(out)).toEqual(["explore-ml-data", "plot-ml-figure"]);
   });
 
   it("never evicts the new skills or pinned bodies", () => {
-    const loaded = [
-      { name: "explore-ml-data", seq: 1 },
-      { name: "setup-ml-project", seq: 2 },
-      { name: "build-ml-pipeline", seq: 3 },
-    ];
-    const out = selectBodiesSupersededBy(
-      ["setup-ml-project", "build-ml-pipeline"],
-      loaded,
-      skills,
-      new Set(["explore-ml-data"]),
-      configWithDefaults(),
-    );
-    expect(out).toEqual([]);
+    const loaded = loadedInOrder("explore-ml-data", "setup-ml-project", "persist-ml-git");
+    expect(supersede(["setup-ml-project", "persist-ml-git"], loaded, {}, ["explore-ml-data"])).toEqual([]);
   });
 
-  it("archives nothing when every new skill is a helper", () => {
-    const loaded = [
-      { name: "explore-ml-data", seq: 1 },
-      { name: "setup-ml-project", seq: 2 },
-    ];
-    const config = configWithDefaults({ helperSkills: ["setup-ml-project"] });
-    expect(selectBodiesSupersededBy(["setup-ml-project"], loaded, skills, new Set(), config)).toEqual([]);
+  it("evicts nothing when every new skill is a helper", () => {
+    expect(supersede(["persist-ml-git"], loadedInOrder("explore-ml-data", "persist-ml-git"), {}, [], ["persist-ml-git"])).toEqual([]);
   });
 
-  it("scores against the non-helper skills only when helpers load together with an owner", () => {
-    const loaded = [
-      { name: "explore-ml-data", seq: 1 },
-      { name: "setup-ml-project", seq: 2 },
-      { name: "build-ml-pipeline", seq: 3 },
-    ];
-    // build-ml-pipeline's description shares "data" with explore-ml-data, so
-    // explore would survive if the helper's text were used too; here the
-    // helper (build) is ignored and setup decides.
-    const config = configWithDefaults({ helperSkills: ["build-ml-pipeline"] });
-    const out = selectBodiesSupersededBy(["setup-ml-project", "build-ml-pipeline"], loaded, skills, new Set(), config);
+  it("judges against the non-helper skills only when helpers load with an owner", () => {
+    // plot-ml-figure is a helper; persist-ml-git decides and evicts explore.
+    const out = supersede(["persist-ml-git", "plot-ml-figure"], loadedInOrder("explore-ml-data", "persist-ml-git", "plot-ml-figure"), {}, [], ["plot-ml-figure"]);
     expect(names(out)).toEqual(["explore-ml-data"]);
-    expect(out[0].reason).toContain("superseded by setup-ml-project");
-    expect(out[0].reason).not.toContain("build-ml-pipeline");
+    expect(out[0].reason).toContain("superseded by persist-ml-git (");
   });
 
-  it("archives an older helper body when a non-helper skill is loaded", () => {
-    const loaded = [
-      { name: "explore-ml-data", seq: 1 },
-      { name: "setup-ml-project", seq: 2 },
-    ];
-    const config = configWithDefaults({ helperSkills: ["explore-ml-data"] });
-    expect(names(selectBodiesSupersededBy(["setup-ml-project"], loaded, skills, new Set(), config))).toEqual(["explore-ml-data"]);
+  it("with protectCallers, keeps bodies whose skill mentions the new skill", () => {
+    const loaded = loadedInOrder("explore-ml-data", "build-ml-pipeline", "persist-ml-git");
+    // explore-ml-data mentions persist-ml-git; build-ml-pipeline does not.
+    expect(names(supersede(["persist-ml-git"], loaded, { protectCallers: true }))).toEqual(["build-ml-pipeline"]);
+    expect(names(supersede(["persist-ml-git"], loaded))).toEqual(["build-ml-pipeline", "explore-ml-data"]);
   });
 
   it("returns nothing without a new skill", () => {
-    expect(selectBodiesSupersededBy([], [{ name: "explore-ml-data", seq: 1 }], skills, new Set(), configWithDefaults())).toEqual([]);
+    expect(supersede([], loadedInOrder("explore-ml-data"))).toEqual([]);
   });
 });
